@@ -1,2 +1,0 @@
-+ ulimit -s unlimited
-+ mpirun --mca btl '^openib' -np 21 ./mcmc
