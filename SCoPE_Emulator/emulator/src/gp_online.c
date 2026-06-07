@@ -7,8 +7,9 @@
 
 #define IDX(i, j, ncol) ((i)*(ncol)+(j))
 #define EPS 1e-12
+#define M_PI 3.14159265358979323846
 
-/* ---------- kernel and covariance builders (same as before) ---------- */
+/* ---------- kernel and covariance builders ---------- */
 static double kernel_ard_rbf(const double *x1, const double *x2,
                              double sigma_f, const double *ell, int n) {
     double r2 = 0.0;
@@ -33,6 +34,111 @@ static void build_covariance(const double *X, int N, int n_inputs,
             K[j*N + i] = k;
         }
     }
+}
+
+/* ---------- log marginal likelihood (reuses workspace) ---------- */
+static double log_marginal_likelihood(const double *X, const double *y, int N,
+                                      int n_inputs,
+                                      double sigma_f, const double *ell,
+                                      double sigma_n) {
+    double *K = malloc(N * N * sizeof(double));
+    build_covariance(X, N, n_inputs, sigma_f, ell, sigma_n, K);
+
+    int info = LAPACKE_dpotrf(LAPACK_ROW_MAJOR, 'L', N, K, N);
+    if (info != 0) {
+        free(K);
+        return -1e300;
+    }
+
+    double *alpha = malloc(N * sizeof(double));
+    memcpy(alpha, y, N * sizeof(double));
+    info = LAPACKE_dpotrs(LAPACK_ROW_MAJOR, 'L', N, 1, K, N, alpha, 1);
+    if (info != 0) {
+        free(K);
+        free(alpha);
+        return -1e300;
+    }
+
+    double logdet = 0.0;
+    for (int i = 0; i < N; i++) logdet += 2.0 * log(K[i*N + i]);
+
+    double quad = 0.0;
+    for (int i = 0; i < N; i++) quad += y[i] * alpha[i];
+
+    free(K);
+    free(alpha);
+    return -0.5 * quad - 0.5 * logdet - 0.5 * N * log(2.0 * M_PI);
+}
+
+/* ---------- simple coordinate ascent hyperparameter optimisation ---------- */
+static void optimize_hyperparams(const double *X_norm, const double *y_norm,
+                                 int N, int n_inputs,
+                                 double *sigma_f, double *sigma_n,
+                                 double *ell,
+                                 int max_iter) {
+    /* Start with reasonable guesses */
+    double sf = *sigma_f, sn = *sigma_n;
+    double log_sf = log(sf);
+    double log_sn = log(sn);
+    double *log_ell = malloc(n_inputs * sizeof(double));
+    for (int i = 0; i < n_inputs; i++) log_ell[i] = log(ell[i]);
+
+    double step = 0.5;
+    double best_lml = log_marginal_likelihood(X_norm, y_norm, N, n_inputs, sf, ell, sn);
+
+    for (int iter = 0; iter < max_iter; iter++) {
+        int improved = 0;
+
+        /* Optimise log_sigma_f */
+        double cand_lml;
+        cand_lml = log_marginal_likelihood(X_norm, y_norm, N, n_inputs, exp(log_sf + step), ell, sn);
+        if (cand_lml > best_lml) {
+            log_sf += step; best_lml = cand_lml; improved = 1;
+        } else {
+            cand_lml = log_marginal_likelihood(X_norm, y_norm, N, n_inputs, exp(log_sf - step), ell, sn);
+            if (cand_lml > best_lml) {
+                log_sf -= step; best_lml = cand_lml; improved = 1;
+            }
+        }
+
+        /* Optimise each length scale */
+        for (int d = 0; d < n_inputs; d++) {
+            double orig = log_ell[d];
+            log_ell[d] = orig + step;
+            cand_lml = log_marginal_likelihood(X_norm, y_norm, N, n_inputs, exp(log_sf), exp(log_ell), sn);
+            if (cand_lml > best_lml) {
+                best_lml = cand_lml; improved = 1;
+            } else {
+                log_ell[d] = orig - step;
+                cand_lml = log_marginal_likelihood(X_norm, y_norm, N, n_inputs, exp(log_sf), exp(log_ell), sn);
+                if (cand_lml > best_lml) {
+                    best_lml = cand_lml; improved = 1;
+                } else {
+                    log_ell[d] = orig;
+                }
+            }
+        }
+
+        /* Optimise log_sigma_n */
+        cand_lml = log_marginal_likelihood(X_norm, y_norm, N, n_inputs, exp(log_sf), ell, exp(log_sn + step));
+        if (cand_lml > best_lml) {
+            log_sn += step; best_lml = cand_lml; improved = 1;
+        } else {
+            cand_lml = log_marginal_likelihood(X_norm, y_norm, N, n_inputs, exp(log_sf), ell, exp(log_sn - step));
+            if (cand_lml > best_lml) {
+                log_sn -= step; best_lml = cand_lml; improved = 1;
+            }
+        }
+
+        if (!improved) step *= 0.5;
+        if (step < 1e-3) break;
+    }
+
+    *sigma_f = exp(log_sf);
+    *sigma_n = exp(log_sn);
+    for (int i = 0; i < n_inputs; i++) ell[i] = exp(log_ell[i]);
+
+    free(log_ell);
 }
 
 /* ---------- Public functions ---------- */
@@ -99,18 +205,28 @@ void online_gp_train(GPModel *gp, const double *X, const double *y, int N) {
     double *y_norm = malloc(N * sizeof(double));
     for (int i = 0; i < N; i++) y_norm[i] = (y[i] - y_mean) / y_std;
 
-    /* Hyperparameters (fixed – you could optimise) */
+    /* Initial hyperparameters (will be optimised) */
     double sigma_f = 1.0;
     double sigma_n = 0.01;
-    for (int i = 0; i < n_in; i++) gp->ell[i] = 1.0;
+    double *ell = malloc(n_in * sizeof(double));
+    for (int i = 0; i < n_in; i++) ell[i] = 1.0;
 
+    /* Optimise hyperparameters (20 iterations is enough) */
+    optimize_hyperparams(X_norm, y_norm, N, n_in, &sigma_f, &sigma_n, ell, 20);
+
+    /* Store optimised hyperparameters */
+    gp->sigma_f = sigma_f;
+    gp->sigma_n = sigma_n;
+    for (int i = 0; i < n_in; i++) gp->ell[i] = ell[i];
+
+    /* Build covariance with optimised hyperparameters */
     double *K = malloc(N * N * sizeof(double));
-    build_covariance(X_norm, N, n_in, sigma_f, gp->ell, sigma_n, K);
+    build_covariance(X_norm, N, n_in, sigma_f, ell, sigma_n, K);
 
     int info = LAPACKE_dpotrf(LAPACK_ROW_MAJOR, 'L', N, K, N);
     if (info != 0) {
         fprintf(stderr, "GP Cholesky failed\n");
-        free(X_norm); free(y_norm); free(K);
+        free(X_norm); free(y_norm); free(K); free(ell);
         return;
     }
 
@@ -133,8 +249,8 @@ void online_gp_train(GPModel *gp, const double *X, const double *y, int N) {
     gp->alpha = alpha;
     gp->chol_L = K;
     gp->n_train = N;
-    gp->sigma_f = sigma_f;
-    gp->sigma_n = sigma_n;
+
+    free(ell);
 }
 
 double online_gp_predict_mean(const GPModel *gp, const double *x) {
