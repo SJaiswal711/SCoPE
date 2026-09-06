@@ -27,6 +27,10 @@ double get_time(void);
 #define POLY_DEGREE 2     /* only used if EMULATOR_TYPE == 1 */
 #define FALLBACK_THRESHOLD 0.05
 
+// ============================ Runtime flags ============================
+int USE_DR = 1;          /* 1 = enable delayed rejection, 0 = disable */
+int USE_EMULATOR = 1;    /* 1 = use emulator when available, 0 = always fallback to CAMB */
+
 /* Emulator instance and helper variables (per slave) */
 static Emulator *g_emulator = NULL;
 static int local_step = 0;          /* Counter for true evaluations (buffer updates) */
@@ -80,7 +84,9 @@ double fast_evec[MAX_FAST][MAX_FAST];
 double fast_EntireFactor = 0.5;
 int    fast_cov_ready = 0;
 double fast_cov_buffer[MAX_FAST_PACKED];
-const int USE_DRAGGING = 1;
+
+// Global flag for fast dragging (now user‑controllable)
+int USE_DRAGGING = 1;   // default: ON
 
 // Global configuration
 Config global_config;
@@ -147,9 +153,7 @@ static int TAKETASK = 3;   // < MPI flag indicating master()'s request to slave 
 // SLAVEPARCHAIN: number of slaves per chain
 int SLAVEPARCHAIN = 3;
 
-// ============================ ADDED: Runtime flags ============================
-int USE_DR = 1;          /* 1 = enable delayed rejection, 0 = disable */
-int USE_EMULATOR = 1;    /* 1 = use emulator when available, 0 = always fallback to CAMB */
+
 // ===============================================================================
 
 // For the adaptive stepsize algoritm, variable step length; these numbers are
@@ -929,7 +933,8 @@ int master(double **startnum, unsigned short int Restart)
     if (status.MPI_TAG == GIVEMETASK)
     {
       int i = (status.MPI_SOURCE - 1) / SLAVEPARCHAIN; // which chain's middleman sent this?
-      int use_dragging = (chainSize[i] >= BEGINCOVUPDATE) ? 1 : 0;
+      // Only enable dragging if both the global flag is ON and the chain has enough points.
+      int use_dragging = (USE_DRAGGING && chainSize[i] >= BEGINCOVUPDATE) ? 1 : 0;
       // <-- MODIFIED: if DR off, only one proposal
       int num_proposals = USE_DR ? SLAVEPARCHAIN : 1;
       total_proposals += num_proposals;   // <-- ADDED
@@ -1009,6 +1014,7 @@ int master(double **startnum, unsigned short int Restart)
     {
       int i = (status.MPI_SOURCE - 1) / SLAVEPARCHAIN; // chain index
 
+      // Write to investigated file: parameters + chi2 (result[0..PARAMETERS]) + chain index
       for (unsigned int k = 0; k <= PARAMETERS; k++)
         fprintf(investigated[i], "%e  ", result[k]);
       fprintf(investigated[i], " %d\n", i);
@@ -1033,16 +1039,13 @@ int master(double **startnum, unsigned short int Restart)
       // ----------------------------------------------------------------------------------------
       if (take == 1)
       {
-        // Calculate the true Chi2 from the stored Log-Likelihood
-        double current_chi2 = -2.0 * chain[i][chainBack[i] - 1].f[LOGLIKEPOS];
-
-        // Write cleanly formatted columns: Mult, Chi2, Params...
-        fprintf(data[i], "%-5d %-16.6f", chain[i][chainBack[i] - 1].Multiplicity, current_chi2);
-
-        for (unsigned int k = 0; k < PARAMETERS; k++) {
-            fprintf(data[i], " %-18.6f", chain[i][chainBack[i] - 1].f[k]);
-        }
-        fprintf(data[i], "\n");
+        // Write chain file: parameters, then logL (twice to match code0), then multiplicity
+        for (unsigned int k = 0; k < PARAMETERS; k++)
+            fprintf(data[i], "%e  ", chain[i][chainBack[i] - 1].f[k]);
+        fprintf(data[i], "%e  %e  ", 
+                chain[i][chainBack[i] - 1].f[LOGLIKEPOS],
+                chain[i][chainBack[i] - 1].f[LOGLIKEPOS]);
+        fprintf(data[i], "%d \n", chain[i][chainBack[i] - 1].Multiplicity);
 
         // ADAPTIVE: increase stepsize, if we take steps  too often
         if (ADAPTIVE == 1)
@@ -1157,10 +1160,12 @@ int master(double **startnum, unsigned short int Restart)
           free(covSlow);
         }
 
-        // Fix: Broadcast ONLY when a valid matrix has just been generated
-        int worldsz;
-        MPI_Comm_size(MPI_COMM_WORLD, &worldsz);
-        broadcast_fast_covariance(cov, worldsz);
+        // Only broadcast fast covariance if dragging is enabled globally
+        if (USE_DRAGGING) {
+            int worldsz;
+            MPI_Comm_size(MPI_COMM_WORLD, &worldsz);
+            broadcast_fast_covariance(cov, worldsz);
+        }
 
         // output information, in text file as well as binary format for re-starting
         fprintf(covarianceMatrices, "Chain: %d Step: %d Points used: %d\n", i + 1, chainSize[i], covSize[i]);
@@ -1231,7 +1236,7 @@ int master(double **startnum, unsigned short int Restart)
           min_size = chainSize[ii];
       }
 
-      // output of progress information
+      // output of progress information (same format as code0)
       fprintf(progress, "performed/Chainsize: ");
       for (unsigned int ii = 0; ii < CHAINS; ii++)
         fprintf(progress, "%d/%d  ", chainTotalPerformed[ii], chainSize[ii]);
@@ -1405,8 +1410,8 @@ int master(double **startnum, unsigned short int Restart)
           }
         }
 
+        // Print statistics in the same format as code0
         fprintf(progress, "Statistics: \n");
-
         for (unsigned int k = 0; k < PARAMETERS; k++)
           fprintf(progress, "%d  dist_y: %e   B: %e   W: %e     R[k]:  %e \n", k, dist_y[k], B[k], W[k], R[k]);
 
@@ -1419,6 +1424,7 @@ int master(double **startnum, unsigned short int Restart)
           fprintf(progress, "%d (%e)  ", chain[ii][chainBack[ii] - 1].Multiplicity, EntireFactor[ii]);
         fprintf(progress, "\n");
 
+        // Write gelmanRubin.txt in code0 format
         if ((min_size) != checkSize)
         {
           fprintf(gelmanRubin, "%d   ", break_at);
@@ -1512,7 +1518,6 @@ int slave(int rank)
   double task[MAX_TASKARRAY_SIZE];
   
   int l_max_alloc = 3000;
-  // Allocate dedicated arrays for A and B states to cache CAMB output (used only in fallback)
   double *Cl_TT_A = (double*)malloc((l_max_alloc + 1) * sizeof(double));
   double *Cl_TE_A = (double*)malloc((l_max_alloc + 1) * sizeof(double));
   double *Cl_EE_A = (double*)malloc((l_max_alloc + 1) * sizeof(double));
@@ -1526,9 +1531,8 @@ int slave(int rank)
   double g_lowbound[NOPARAM], g_highbound[NOPARAM], g_sigma[NOPARAM];
   get_parameter_bounds_from_config(g_lowbound, g_highbound, g_sigma);
 
-  // --- EMULATOR INITIALISATION (only if USE_EMULATOR) ---
   if (!mapping_done) {
-      g_n_cosmo = N_SLOW;   // N_SLOW is already set by classify_parameters()
+      g_n_cosmo = N_SLOW;
       if (g_n_cosmo == 0) {
           fprintf(stderr, "Rank %d: WARNING: No slow parameters found! Using default 6.\n", rank);
           g_n_cosmo = 6;
@@ -1538,7 +1542,6 @@ int slave(int rank)
       mapping_done = 1;
   }
 
-  // <-- ADDED: only initialise emulator if USE_EMULATOR is on
   if (USE_EMULATOR && g_emulator == NULL) {
       EmulatorConfig emu_cfg = {
           .n_params = g_n_cosmo,
@@ -1565,22 +1568,6 @@ int slave(int rank)
       }
   }
 
-  // --- Open detail log file in output directory ---
-  char detail_path[512];
-  snprintf(detail_path, sizeof(detail_path), "%s/detail_%d.log", outdir_buf, rank);
-  FILE *detail_file = fopen(detail_path, "w");
-  if (detail_file) {
-      fprintf(detail_file, "# Step  Emu  Fallback  Uncertainty  chi2  logL");
-      for (int i = 0; i < PARAMETERS; i++) {
-          fprintf(detail_file, "  param_%d", i);
-      }
-      fprintf(detail_file, "\n");
-      fflush(detail_file);
-  } else {
-      fprintf(stderr, "Rank %d: Warning: Could not open detail log file %s\n", rank, detail_path);
-  }
-
-  // <-- ADDED: progress file per slave
   char progress_path[512];
   snprintf(progress_path, sizeof(progress_path), "%s/progress_rank%d.log", outdir_buf, rank);
   FILE *progress_file = fopen(progress_path, "w");
@@ -1589,40 +1576,37 @@ int slave(int rank)
       progress_file = stdout;
   }
 
-  // <-- ADDED: counters for progress
+  printf("\n"
+         "------------------------------------------------------------------------------------------------------------------------------\n"
+         " Rank  MCMC_step  Emu  Fallback  Uncertainty    chi2      logL       Omega_m    Omega_b       h        tau      n_s       A_s\n"
+         "------------------------------------------------------------------------------------------------------------------------------\n");
+  fflush(stdout);
+
   double start_wtime = MPI_Wtime();
   int proposal_count = 0;
   int emu_count = 0;
 
-  // Determine if this slave is the middleman for its chain
   int is_middleman = middleman(rank);
   int chain_index = (rank - 1) / SLAVEPARCHAIN;
 
-  // Variables for middleman logic (like in earlier code)
   double loglike = -1.0e30;
   unsigned short int takenindex = 0, take = 0;
 
   for (;;) 
   {  
-      // <-- ADDED: check for stop signal
       MPI_Status probe_status;
       int flag = 0;
       MPI_Iprobe(0, TAG_STOP, MPI_COMM_WORLD, &flag, &probe_status);
       if (flag) {
           MPI_Recv(NULL, 0, MPI_INT, 0, TAG_STOP, MPI_COMM_WORLD, &probe_status);
-          fprintf(progress_file, "[Rank %d] Received stop signal. Exiting.\n", rank);
-          fflush(progress_file);
           if (progress_file && progress_file != stdout) fclose(progress_file);
-          if (detail_file) fclose(detail_file);
           break;
       }
 
-      // If middleman, request a task from master (which will send tasks to all slaves in the chain)
       if (is_middleman) {
           MPI_Send(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, GIVEMETASK, MPI_COMM_WORLD);
       }
 
-      // Probe for covariance updates before accepting the task
       for (;;) {
           MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
           if (status.MPI_TAG == TAG_UPDATE_COV) {
@@ -1630,11 +1614,10 @@ int slave(int rank)
               update_local_fast_covariance(fast_cov_buffer);
               continue;
           }
-          break; // It's TAKETASK
+          break;
       }
       MPI_Recv(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, TAKETASK, MPI_COMM_WORLD, &status); 
       
-      // --- Extract MCMC step number ---
       int mcmc_step = (int)task[STEP_POS];
 
       double theta_A[MAX_TASKARRAY_SIZE] = {0};
@@ -1646,25 +1629,23 @@ int slave(int rank)
       }
 
       double final_chi2 = 1e30;
+      double proposal_chi2 = 1e30;
       int accepted = 0;
       int use_dragging = (int)task[DRAGPOS];
       double fast_EntireFactor_local = task[FASTFACTORPOS];
 
-      // --- Try emulator prediction for slow parameters of A and B ---
       int use_emu = 0;
       double uncertainty_A = 0.0, uncertainty_B = 0.0;
       double emu_cl_tt_A[2601], emu_cl_te_A[2601], emu_cl_ee_A[2601], emu_cl_bb_A[2601];
       double emu_cl_tt_B[2601], emu_cl_te_B[2601], emu_cl_ee_B[2601], emu_cl_bb_B[2601];
       int emu_ok_A = 0, emu_ok_B = 0;
 
-      // Extract slow (cosmological) parameters from theta_A and theta_B
       double cosmo_A[N_SLOW], cosmo_B[N_SLOW];
       for (int k = 0; k < N_SLOW; k++) {
           cosmo_A[k] = theta_A[slow_idx[k]];
           cosmo_B[k] = theta_B[slow_idx[k]];
       }
 
-      // <-- MODIFIED: only use emulator if USE_EMULATOR is on
       if (USE_EMULATOR && g_emulator && emulator_is_ready(g_emulator)) {
           emu_ok_A = emulator_predict(g_emulator, cosmo_A,
                                        emu_cl_tt_A, emu_cl_te_A, emu_cl_ee_A, emu_cl_bb_A,
@@ -1679,7 +1660,6 @@ int slave(int rank)
           }
       }
 
-      // <-- ADDED: update counters and log progress every 500 proposals
       proposal_count++;
       if (use_emu) emu_count++;
       if (proposal_count % 500 == 0) {
@@ -1695,21 +1675,20 @@ int slave(int rank)
           int really_inv = (int)task[MULTIPURPOSEPOS];
 
           if (use_emu) {
-              final_chi2 = run_plc(rank, theta_B, emu_cl_tt_B, emu_cl_te_B, emu_cl_ee_B, emu_cl_bb_B, 0, NULL);
-              printf("Rank %d: BURN-IN (emu) final_chi2 = %f\n", rank, final_chi2);
+              proposal_chi2 = run_plc(rank, theta_B, emu_cl_tt_B, emu_cl_te_B, emu_cl_ee_B, emu_cl_bb_B, 0, NULL);
+              final_chi2 = proposal_chi2;
           } else {
               int ok = param_iface(rank, theta_B, Cl_TT_B, Cl_TE_B, Cl_EE_B, Cl_BB_B);
               if (ok) {
                   double dummy = 0.0;
-                  final_chi2 = run_plc(rank, theta_B, Cl_TT_B, Cl_TE_B, Cl_EE_B, Cl_BB_B, 0, NULL);
-                  printf("Rank %d: BURN-IN (CAMB) final_chi2 = %f\n", rank, final_chi2);
+                  proposal_chi2 = run_plc(rank, theta_B, Cl_TT_B, Cl_TE_B, Cl_EE_B, Cl_BB_B, 0, NULL);
+                  final_chi2 = proposal_chi2;
               } else {
+                  proposal_chi2 = 1e30;
                   final_chi2 = 1e30;
-                  printf("Rank %d: BURN-IN param_iface failed\n", rank);
               }
           }
 
-          // Re‑evaluate current state if stuck (ghost minima cure)
           if (really_inv > 10) {
               double cur_re_eval = 1e30;
               if (use_emu) {
@@ -1734,19 +1713,23 @@ int slave(int rank)
               for (int k = 0; k < PARAMETERS; k++) final_theta[k] = theta_B[k];
           }
       }
-      // --- FAST DRAGGING MCMC ---
+      // --- FAST DRAGGING MCMC with caching of "other" chi2 ---
       else {
           double dummy = 0.0;
           double chi2_A_state, chi2_B_state;
+          double cached_other_A = 0.0, cached_other_B = 0.0;  // store -2*logL(Commander+Lowlike)
 
+          // Compute full chi² for A and B, capturing the "other" part
           if (use_emu) {
-              chi2_A_state = run_plc(rank, theta_A, emu_cl_tt_A, emu_cl_te_A, emu_cl_ee_A, emu_cl_bb_A, 0, NULL);
-              chi2_B_state = run_plc(rank, theta_B, emu_cl_tt_B, emu_cl_te_B, emu_cl_ee_B, emu_cl_bb_B, 0, NULL);
+              chi2_A_state = run_plc(rank, theta_A, emu_cl_tt_A, emu_cl_te_A, emu_cl_ee_A, emu_cl_bb_A, 0, &cached_other_A);
+              chi2_B_state = run_plc(rank, theta_B, emu_cl_tt_B, emu_cl_te_B, emu_cl_ee_B, emu_cl_bb_B, 0, &cached_other_B);
+              proposal_chi2 = chi2_B_state;
           } else {
               param_iface(rank, theta_A, Cl_TT_A, Cl_TE_A, Cl_EE_A, Cl_BB_A);
               param_iface(rank, theta_B, Cl_TT_B, Cl_TE_B, Cl_EE_B, Cl_BB_B);
-              chi2_A_state = run_plc(rank, theta_A, Cl_TT_A, Cl_TE_A, Cl_EE_A, Cl_BB_A, 0, NULL);
-              chi2_B_state = run_plc(rank, theta_B, Cl_TT_B, Cl_TE_B, Cl_EE_B, Cl_BB_B, 0, NULL);
+              chi2_A_state = run_plc(rank, theta_A, Cl_TT_A, Cl_TE_A, Cl_EE_A, Cl_BB_A, 0, &cached_other_A);
+              chi2_B_state = run_plc(rank, theta_B, Cl_TT_B, Cl_TE_B, Cl_EE_B, Cl_BB_B, 0, &cached_other_B);
+              proposal_chi2 = chi2_B_state;
           }
 
           if (chi2_A_state < 1e29 && chi2_B_state < 1e29) {
@@ -1783,15 +1766,21 @@ int slave(int rank)
                           thA[slow_idx[k]] = theta_A[slow_idx[k]];
                           thB[slow_idx[k]] = theta_B[slow_idx[k]];
                       }
-                      // REUSE cached spectra (from emulator or CAMB) – no new CAMB/emulator calls!
-                      chi2_A_trial = run_plc(rank, thA, (use_emu ? emu_cl_tt_A : Cl_TT_A),
+
+                      // *** USE FAST MODE WITH CACHED OTHER CHI2 ***
+                      chi2_A_trial = run_plc(rank, thA,
+                                             (use_emu ? emu_cl_tt_A : Cl_TT_A),
                                              (use_emu ? emu_cl_te_A : Cl_TE_A),
                                              (use_emu ? emu_cl_ee_A : Cl_EE_A),
-                                             (use_emu ? emu_cl_bb_A : Cl_BB_A), 0, NULL);
-                      chi2_B_trial = run_plc(rank, thB, (use_emu ? emu_cl_tt_B : Cl_TT_B),
+                                             (use_emu ? emu_cl_bb_A : Cl_BB_A),
+                                             1, &cached_other_A);   // fast_mode=1, reuse cached_other_A
+
+                      chi2_B_trial = run_plc(rank, thB,
+                                             (use_emu ? emu_cl_tt_B : Cl_TT_B),
                                              (use_emu ? emu_cl_te_B : Cl_TE_B),
                                              (use_emu ? emu_cl_ee_B : Cl_EE_B),
-                                             (use_emu ? emu_cl_bb_B : Cl_BB_B), 0, NULL);
+                                             (use_emu ? emu_cl_bb_B : Cl_BB_B),
+                                             1, &cached_other_B);   // fast_mode=1, reuse cached_other_B
                   }
 
                   double L_cur   = (1.0-w)*chi2_A_state + w*chi2_B_state;
@@ -1814,14 +1803,15 @@ int slave(int rank)
                   for (int k = 0; k < PARAMETERS; k++) final_theta[k] = theta_f_path[k];
                   for (int k = 0; k < N_SLOW; k++) final_theta[slow_idx[k]] = theta_B[slow_idx[k]];
                   final_chi2 = chi2_B_state;
+                  proposal_chi2 = chi2_B_state;
                   accepted = 1;
               }
           }
       }
 
-      // --- Update emulator buffer if this was a fallback step and accepted ---
+      task[PARAMETERS] = proposal_chi2;
+
       if (accepted && !use_emu && g_emulator) {
-          // Allocate fresh arrays for true spectra
           double *Cl_TT_true = (double*)malloc(2601 * sizeof(double));
           double *Cl_TE_true = (double*)malloc(2601 * sizeof(double));
           double *Cl_EE_true = (double*)malloc(2601 * sizeof(double));
@@ -1833,9 +1823,6 @@ int slave(int rank)
                   for (int k = 0; k < N_SLOW; k++) cosmo_final[k] = final_theta[slow_idx[k]];
                   emulator_update(g_emulator, local_step++, cosmo_final,
                                   Cl_TT_true, Cl_TE_true, Cl_EE_true, Cl_BB_true, true_logL);
-                  printf("Rank %d: Buffer updated. local_step=%d, size=%d, trained=%d\n",
-                         rank, local_step, emulator_buffer_size(g_emulator), emulator_is_ready(g_emulator));
-                  // DO NOT FREE – buffer owns pointers
               } else {
                   free(Cl_TT_true); free(Cl_TE_true); free(Cl_EE_true); free(Cl_BB_true);
               }
@@ -1844,13 +1831,11 @@ int slave(int rank)
           }
       }
 
-      // --- Force training if buffer is full but emulator not trained ---
       if (g_emulator && !emulator_is_ready(g_emulator) && emulator_buffer_size(g_emulator) >= 200) {
           printf("Rank %d: Forcing emulator training. Buffer size = %d\n", rank, emulator_buffer_size(g_emulator));
           emulator_train(g_emulator);
       }
 
-      // --- Prepare and send result ---
       if (accepted) {
           for (int k = 0; k < PARAMETERS; k++) task[k] = final_theta[k];
           task[LOGLIKEPOS] = -0.5 * final_chi2; 
@@ -1859,31 +1844,26 @@ int slave(int rank)
           task[TAKEPOS] = 0.0;
       }
 
-      // ============================================================
-      // ** WRITE TO DETAIL LOG FILE **
-      // ============================================================
-      if (detail_file) {
-          double chi2_to_log = (accepted) ? final_chi2 : -2.0 * task[LOGLIKEPOS];
-          double logL_to_log = -0.5 * chi2_to_log;
-          double *params_to_log = (accepted) ? final_theta : theta_A;
-
-          fprintf(detail_file, "%d  %d  %d  %.6e  %.6f  %.6f",
-                  mcmc_step, use_emu, !use_emu, uncertainty_A, chi2_to_log, logL_to_log);
-          for (int i = 0; i < PARAMETERS; i++) {
-              fprintf(detail_file, "  %.8f", params_to_log[i]);
-          }
-          fprintf(detail_file, "\n");
-          fflush(detail_file);
+      double chi2_to_print = (accepted) ? final_chi2 : -2.0 * task[LOGLIKEPOS];
+      double logL_to_print = -0.5 * chi2_to_print;
+      int max_print = (g_n_cosmo < 6) ? g_n_cosmo : 6;
+      double *params_to_print = (accepted) ? final_theta : theta_A;
+      printf(" %2d     %6d    %1d      %1d     %8.4e   %8.2f %8.2f   ",
+             rank, mcmc_step, use_emu, (!use_emu), (use_emu ? uncertainty_A : 0.0),
+             chi2_to_print, logL_to_print);
+      for (int i = 0; i < max_print; i++) {
+          printf("%8.4f ", params_to_print[i]);
       }
+      for (int i = max_print; i < 6; i++) {
+          printf("%8s ", " ");
+      }
+      printf("\n");
+      fflush(stdout);
 
-      // Send result to master (if middleman, it will send after collecting all)
-      // For simplicity, we send directly to master.
       MPI_Send(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, TAKERESULT, MPI_COMM_WORLD);   
   } 
   
-  if (detail_file) fclose(detail_file);
   if (progress_file && progress_file != stdout) fclose(progress_file);
-  
   free(Cl_TT_A); free(Cl_TE_A); free(Cl_EE_A); free(Cl_BB_A);
   free(Cl_TT_B); free(Cl_TE_B); free(Cl_EE_B); free(Cl_BB_B);
   return 0;
@@ -2180,9 +2160,13 @@ int main(int argc, char *argv[])
           USE_EMULATOR = 1;
       } else if (strcmp(argv[i], "-no-emu") == 0) {
           USE_EMULATOR = 0;
+      } else if (strcmp(argv[i], "-drag") == 0) {
+          USE_DRAGGING = 1;
+      } else if (strcmp(argv[i], "-no-drag") == 0) {
+          USE_DRAGGING = 0;
       } else {
           if (myrank == 0) {
-              printf("Usage: %s [-restart] [-o output_dir] [-dr | -no-dr] [-emu | -no-emu]\n", argv[0]);
+              printf("Usage: %s [-restart] [-o output_dir] [-dr | -no-dr] [-emu | -no-emu] [-drag | -no-drag]\n", argv[0]);
           }
           MPI_Abort(MPI_COMM_WORLD, 1);
       }
