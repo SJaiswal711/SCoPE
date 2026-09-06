@@ -28,8 +28,11 @@ double get_time(void);
 #define FALLBACK_THRESHOLD 0.05
 
 // ============================ Runtime flags ============================
-int USE_DR = 1;          /* 1 = enable delayed rejection, 0 = disable */
-int USE_EMULATOR = 1;    /* 1 = use emulator when available, 0 = always fallback to CAMB */
+int USE_DR = 0;          /* 1 = enable delayed rejection, 0 = disable */
+int USE_EMULATOR = 0;    /* 1 = use emulator when available, 0 = always fallback to CAMB */
+
+// Global flag for fast dragging (now user‑controllable)
+int USE_DRAGGING = 1;   // default: ON
 
 /* Emulator instance and helper variables (per slave) */
 static Emulator *g_emulator = NULL;
@@ -84,9 +87,6 @@ double fast_evec[MAX_FAST][MAX_FAST];
 double fast_EntireFactor = 0.5;
 int    fast_cov_ready = 0;
 double fast_cov_buffer[MAX_FAST_PACKED];
-
-// Global flag for fast dragging (now user‑controllable)
-int USE_DRAGGING = 1;   // default: ON
 
 // Global configuration
 Config global_config;
@@ -637,8 +637,8 @@ void get_parameter_bounds_from_config(double *lowbound, double *highbound, doubl
 // Helper functions for multiple slaves per chain
 int myslave_rank(int ii) { return ii * SLAVEPARCHAIN + 1; } // first slave of chain ii (middleman)
 int middleman(int rank) {
-    if (rank % SLAVEPARCHAIN == 1) return 1;
-    return 0;
+    if (SLAVEPARCHAIN == 1) return 1;
+    return (rank % SLAVEPARCHAIN == 1);
 }
 int mymiddlemann(int rank) {
     return ((rank - 1) / SLAVEPARCHAIN) * SLAVEPARCHAIN + 1;
@@ -1448,7 +1448,7 @@ int master(double **startnum, unsigned short int Restart)
         max_size = (max_size > chainBack[ii]) ? max_size : chainBack[ii];
 
       // <-- ADDED: total_proposals limit
-      if ((FREEZE_IN == 0 && loopstop > 18000) || max_size > MAXCHAINLENGTH || total_proposals > 100000)
+      if (max_size > MAXCHAINLENGTH || total_proposals > 2500000)
         work = 0;
 
       fflush(data[i]);
