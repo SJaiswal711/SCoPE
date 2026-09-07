@@ -1148,7 +1148,7 @@ Its primary features are:
 * **Multiple concurrent chains**.
 * **Gelman–Rubin convergence diagnostics**.
 * **Adaptive proposal covariance**.
-* ** Delayed Rejection** for improved mixing without biasing the posterior.
+* **Delayed Rejection** for improved mixing without biasing the posterior.
 * **Dragging** for efficient exploration of nuisance parameters.
 * **Gaussian Process or polynomial emulation** of CMB power spectra.
 * **Fast-mode likelihood caching** to reduce computational cost.
