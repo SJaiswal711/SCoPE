@@ -6,7 +6,7 @@ It uses **MPI for distributed computing** and incorporates several advanced tech
 
 * **Multiple chains** running concurrently with Gelman–Rubin convergence diagnostics.
 * **Adaptive proposal covariance** using chain history to tune the proposal distribution.
-* **Formal Delayed Rejection (DR)** — a mathematically correct scheme that, upon rejection, attempts a second or third proposal with a narrower step size while maintaining detailed balance.
+* **Delayed Rejection (DR)** — a mathematically correct scheme that, upon rejection, attempts a second or third proposal with a narrower step size while maintaining detailed balance.
 * **Dragging** — a fast-mode algorithm that efficiently samples nuisance (fast) parameters through multiple small steps while keeping cosmological (slow) parameters fixed.
 * **Emulator** — Gaussian Process or polynomial models that predict CMB power spectra, avoiding expensive CAMB calls when prediction uncertainty is sufficiently low.
 * **Fast-mode likelihood evaluation** that caches expensive likelihood components such as Commander and Lowlike during dragging steps.
