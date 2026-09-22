@@ -1086,7 +1086,7 @@ int master(double **startnum, unsigned short int Restart) {
                             double OptimalFactor = 2.4 / sqrt((double)PARAMETERS);
                             OptimalFactor = RollingAverage_average(roll[j]);
                             EntireFactor[j] = OptimalFactor;
-                            if (EntireFactor[j] > 1.0) EntireFactor[j] = 0.2;
+                            // if (EntireFactor[j] > 1.0) EntireFactor[j] = 0.2;
                             fprintf(final, "CHAIN[%d] Eigenvector and value info: ", j);
                             // print info
                             fprintf(final, "************************************\n");
