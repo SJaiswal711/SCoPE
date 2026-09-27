@@ -2,10 +2,12 @@
 // ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // //                                                                     Version includes timing, fast_mode, dragging method and emulator
-// //                                                                     with multiple slaves per chain (SLAVEPARCHAIN)
-// //                                                                     MODIFIED: formal Delayed Rejection (traditional DR)
-// //                                                                     ALL BUGS FIXED
-// //                                                                     ADDED: -print / -no-print (VERBOSE) debugging flag
+// //                                                                     SERIAL MODE: SLAVEPARCHAIN = 1 always (one slave per chain)
+// //                                                                     REMOVED: Delayed Rejection (requires multiple slaves per chain)
+// //                                                                     ADDED: -print / -no-print debugging flag
+// //                                                                     ADDED: -load-cov <file> to seed covariance from a saved covMatrix.txt
+// //                                                                     FIXED: dragging outer-reject restores chain state
+// //                                                                     FIXED: dragging owns the full accept/reject decision (Option A)
 
 // /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -32,12 +34,11 @@ double get_time(void);
 #define FALLBACK_THRESHOLD 0.05
 
 // ============================ Runtime flags ============================
-int USE_DR = 1;          /* 1 = enable delayed rejection, 0 = disable */
-int USE_EMULATOR = 0;    /* 1 = use emulator when available, 0 = always fallback to CAMB */
+int USE_EMULATOR = 1;    /* 1 = use emulator when available, 0 = always fallback to CAMB */
 int USE_DRAGGING = 1;    /* default: ON */
-int VERBOSE = 1;         /* 1 = print debug messages, 0 = silent (-no-print) */
+int VERBOSE = 1;         /* 1 = print progress, 0 = silent (-no-print) */
 
-/* Debug-print macro: everything routed through this respects -no-print. */
+/* Debug print macro — controls per-iteration verbosity. */
 #define DEBUG_PRINT(...) do { if (VERBOSE) { printf(__VA_ARGS__); fflush(stdout); } } while (0)
 
 /* Emulator instance and helper variables (per slave) */
@@ -46,6 +47,9 @@ static int local_step = 0;
 static int g_n_cosmo = 0;
 static int mapping_done = 0;
 static char outdir_buf[512];
+
+/* Optional covariance seeding */
+static const char *LOAD_COV_PATH = NULL;
 
 // CMBAns header files
 // ---------------------------------------------------------------------
@@ -103,6 +107,7 @@ int STEP_POS;
 
 static unsigned int MULTIPURPOSE_REQUIRED = 1;
 
+
 static short int SDSS = 0;
 static short int TwodF = 0;
 static short int SDSS_BAO = 0;
@@ -126,7 +131,8 @@ static int TAKERESULT = 2;
 static int TAKETASK = 3;
 #define TAG_STOP 4
 
-int SLAVEPARCHAIN = 3;
+/* SERIAL MODE: exactly one slave per chain. */
+#define SLAVEPARCHAIN 1
 
 static double INCREASE_STEP = 1.15;
 static double DECREASE_STEP = 0.9;
@@ -142,15 +148,30 @@ extern void test_likelihood_(int *inputflag, double *cl_in_tt, double *cl_in_te,
 double drfactor;
 int clik_process_initialized = 0;
 
-// A task is just a double array...
-//-----------------------------------------------------------------------------------------
+// A task is just a double array. The benefit of having
+// this structure anyhow is that we can very easily store tasks
+// in lists and all that.
+// Each double variable corresponds to either a parameter,
+// a likelihood, some multipurpose stuff or just no information
+// at all.
+// I find it convenient to leave [0..7] for parameters
+// [8..14] is for likelihoods and after that come multipurpose
+// stuff. If you only need 4 parameters, there will be garbage
+// in [5..7], but as you don't have to look at it, who cares, if
+// you don't ?
+//---------------------------------------------------------------------------------------
 
 typedef struct Task
-{
-  double f[MAX_TASKARRAY_SIZE];
-  int Multiplicity;
-  int ReallyInvestigated;
-} Task;
+{                               // The weigh of this point in the chain,
+  double f[MAX_TASKARRAY_SIZE]; // i.e. how long does it rest at the point
+  int Multiplicity;             //
+                                // The number of times a different model has been
+                                // simulated until the step has been taken.
+                                // This is Multiplicity minus the number of times the
+                                // step proposal crossed the boundaries of parameter Space.
+                                // We take this number as a meassure to increase or
+  int ReallyInvestigated;       // decrease step sizes
+} Task;    
 
 Task *free_Task() {
     Task *tsk = (Task *)malloc(sizeof(Task));
@@ -166,7 +187,18 @@ void Task_copy(Task *tska, Task *tskb) {
     tska->ReallyInvestigated = tskb->ReallyInvestigated;
 }
 
-// RollingAverage
+// Small class to compute a "rolling" average over values.
+// The constructer takes as an argument the maximum number
+// of values. By calling push(x), the value x will be stored and
+// if the number of values exceeds the limit size, the one stored
+// earliest will be erased. Mathematically speaking:
+//
+// average = (\sum_0^size x_i ) / min(size,#values stored)
+// and at each push(), x_i = x_i+1
+//
+// The average is updated at each call to average() by updating
+// the sum of all values. Each 100 calls to average(), it is computed
+// from scratch to limit elimination of significant figures
 // -------------------------------------------------------------------------------------------
 
 typedef struct RollingAverage {
@@ -186,7 +218,7 @@ void Rolling_Average_push(RollingAverage *RA, double x) {
     if (RA->Number >= RA->Size) RA->Number = RA->Size;
 }
 
-void RollingAverage_clear();
+void RollingAverage_clear();  // clear the array
 
 double RollingAverage_average(RollingAverage *RA) {
     if (RA->Number == 0) return 0.0;
@@ -202,6 +234,7 @@ RollingAverage *new_RollingAverage(int Size) {
     RA->y = (double*)malloc(Size * sizeof(double));
     RA->Size = Size;
     RA->idx = 0;
+    // FIX: initialise all fields (previously uninitialised)
     RA->Number = 0;
     RA->Sum = 0.0;
     RA->PerformFullCounter = 0;
@@ -209,17 +242,23 @@ RollingAverage *new_RollingAverage(int Size) {
     return RA;
 }
 
+
 typedef struct MultiGaussian
 {
-  double Scale;
+  double Scale; // bool Lock;
+                // void generateAndTransform();
+                // The row number of the covariance matrix and number of random variables sought.
   unsigned int SIZE;
-  double **MasterMatrix;
-  double *eigenvalues;
-  double *generatedValues;
-  double *lbounds;
+  double **MasterMatrix;   // Encodes the eigenvectors/transformation matrix
+  double *eigenvalues;     // The eigenvalues
+  double *generatedValues; // The random values, generated anew if throwDice() is called
+
+  double *lbounds; // Upper and lower bounds are encoded here
   double *hbounds;
+
   double *randomq;
-  double *center;
+
+  double *center; // The mean of the gaussian to sample from
 } MultiGaussian;
 
 MultiGaussian *new_MultiGaussian(int Size)
@@ -240,6 +279,12 @@ MultiGaussian *new_MultiGaussian(int Size)
   return MG;
 }
 
+// Set bounds for the random variables. This needs to be called before any other
+// function, or unpredictive behaviour will result. In most applications, you will
+// probably set this only once.
+// \param  lowBound a vector with lower Bounds for the random variables
+// \param highBound a vector with upper Bounds for the random variables
+//-----------------------------------------------------------------------------------------------------
 void MultiGaussian_setBounds(MultiGaussian *MG, double lowBound[], double highBound[])
 {
   for (unsigned int i = 0; i < MG->SIZE; i++)
@@ -280,30 +325,38 @@ void nrerror(char s[])
 }
 
 double **convert_matrix(double *a, long nrl, long nrh, long ncl, long nch)
+// allocate a float matrix m[nrl..nrh][ncl..nch] that points to the matrix
+// declared in the standard C manner as a[nrow][ncol], where nrow=nrh-nrl+1
+// and ncol=nch-ncl+1. The routine should be called with the address
+// &a[0][0] as the first argument.
 {
   long i, j, nrow = nrh - nrl + 1, ncol = nch - ncl + 1;
   double **m;
 
+  // allocate pointers to rows
   m = (double **)malloc((unsigned int)((nrow + NR_END) * sizeof(double *)));
   if (!m)
     nrerror("allocation failure in convert_matrix()");
   m += NR_END;
   m -= nrl;
 
+  // set pointers to rows
   m[nrl] = a - ncl;
   for (i = 1, j = nrl + 1; i < nrow; i++, j++)
     m[j] = m[j - 1] + ncol;
+  // return pointer to array of pointers to rows
   return m;
 }
 
 void free_convert_matrix(double **b, long nrl, long nrh, long ncl, long nch)
 {
-  free((FREE_ARG)(b + nrl - NR_END));
+  free((FREE_ARG)(b + nrl - NR_END)); // free a matrix allocated by convert_matrix()
 }
 
-double *vector(long nl, long nh)
+double *vector(long nl, long nh) // allocate a float vector with subscript range v[nl..nh]
 {
   double *v;
+
   v = (double *)malloc((unsigned int)((nh - nl + 1 + NR_END) * sizeof(double)));
   if (!v)
     nrerror("allocation failure in vector()");
@@ -311,7 +364,7 @@ double *vector(long nl, long nh)
 }
 
 void free_vector(double *v, long nl, long nh)
-{
+{ // free a float vector allocated with vector()
   free((FREE_ARG)(v + nl - NR_END));
 }
 
@@ -332,6 +385,7 @@ double fabs(double take)
 double posRnd(double max)
 {
   double rand_max = 1.0 / RAND_MAX;
+
   return rand() * rand_max * max;
 }
 
@@ -386,9 +440,7 @@ int throwDice(Task chain, Task *next, MultiGaussian *MG, int scale)
   for (unsigned int i = 0; i < PARAMETERS; i++)
   {
     next->f[i] = MG->generatedValues[i] * pow(drfactor, scale) + MG->center[i];
-
-    double ev = (MG->eigenvalues[i] > 1e-30) ? MG->eigenvalues[i] : 1e-30;
-    next->f[RANDPOS + i] = (MG->randomq[i] / sqrt(ev)) * pow(drfactor, scale);
+    next->f[RANDPOS + i] = MG->randomq[i] * pow(drfactor, scale);
   }
 
   for (unsigned int i = 0; i < MG->SIZE; i++)
@@ -402,13 +454,22 @@ int throwDice(Task chain, Task *next, MultiGaussian *MG, int scale)
   return 1;
 }
 
+// Generate a set of eigenvectors and eigenvalues from the covariance matrix.
+// Thus, if you whish to sample from a new distribution with covariance matrix S,
+// you need to call this function again. This function uses the eigenvalue and
+// eigenvector routines of the GNU Scientific Library, so if you need this for
+// large matrices it is probably best to change this code and use LAPACK or
+// something similar.
+// param covarianceMatrix the covariance matrix of the distribution you want to draw from
+// -------------------------------------------------------------------------------------------------------------
+
 void generateEigenvectors(MultiGaussian *MG, double **covarianceMatrix, double scale)
 {
   MG->Scale = scale;
   double *data;
-  data = (double *)malloc((MG->SIZE) * (MG->SIZE) * sizeof(double));
+  data = (double *)malloc((MG->SIZE) * (MG->SIZE) * sizeof(double)); // reformat [][] into [] for creating matrix
   int k = 0;
-  for (unsigned int j = 0; j < MG->SIZE; j++)
+  for (unsigned int j = 0; j < MG->SIZE; j++) // copy into tempArray
     for (unsigned int i = 0; i < MG->SIZE; i++)
     {
       data[k] = covarianceMatrix[i][j];
@@ -472,26 +533,31 @@ double normd(double a[], int size)
   return norm;
 }
 
+// Get parameter bounds from config - for all non-nuisance parameters
+// Get parameter bounds from config - for ALL estimated parameters (Cosmo + Nuisance)
 void get_parameter_bounds_from_config(double *lowbound, double *highbound, double *initial_sigma) {
     int param_index = 0;
-
+    
+    // We loop through the config and take EVERYTHING that is marked for estimation
     for(int i = 0; i < global_config.param_count && param_index < PARAMETERS; i++) {
         if(global_config.params[i].is_estimated) {
-
+            
+            // 1. Copy bounds from config
             lowbound[param_index] = global_config.params[i].lower_bound;
             highbound[param_index] = global_config.params[i].upper_bound;
             initial_sigma[param_index] = global_config.params[i].sigma;
-
-            DEBUG_PRINT("Chain Param %d: %s [%.3f, %.3f]\n",
-                        param_index,
-                        global_config.params[i].name,
-                        lowbound[param_index],
+            
+            DEBUG_PRINT("Chain Param %d: %s [%.3f, %.3f]\n", 
+                        param_index, 
+                        global_config.params[i].name, 
+                        lowbound[param_index], 
                         highbound[param_index]);
-
+            
             param_index++;
         }
     }
-
+    
+    // Safety: Fill defaults if for some reason we have fewer config params than PARAMETERS
     for(; param_index < PARAMETERS; param_index++) {
         lowbound[param_index] = 0.0;
         highbound[param_index] = 1.0;
@@ -500,15 +566,10 @@ void get_parameter_bounds_from_config(double *lowbound, double *highbound, doubl
     }
 }
 
-// Helper functions for multiple slaves per chain
-int myslave_rank(int ii) { return ii * SLAVEPARCHAIN + 1; }
-int middleman(int rank) {
-    if (SLAVEPARCHAIN == 1) return 1;
-    return (rank % SLAVEPARCHAIN == 1);
-}
-int mymiddlemann(int rank) {
-    return ((rank - 1) / SLAVEPARCHAIN) * SLAVEPARCHAIN + 1;
-}
+/* SERIAL MODE: helper functions collapse to trivial identities. */
+int myslave_rank(int ii)   { return ii + 1;  }
+int middleman(int rank)    { (void)rank; return 1;  }
+int mymiddlemann(int rank) { return rank;    }
 
 int throwSlowDice(Task chain_pt, Task *next, MultiGaussian *MGs, int scale) {
     for (unsigned int k = 0; k < MGs->SIZE; k++)
@@ -522,16 +583,9 @@ int throwSlowDice(Task chain_pt, Task *next, MultiGaussian *MGs, int scale) {
     for (unsigned int k = 0; k < MGs->SIZE; k++) {
         int idx = slow_idx[k];
         next->f[idx] = MGs->generatedValues[k] * pow(drfactor, scale) + MGs->center[k];
-
-        double ev = (MGs->eigenvalues[k] > 1e-30) ? MGs->eigenvalues[k] : 1e-30;
-        next->f[RANDPOS + k] = (MGs->randomq[k] / sqrt(ev)) * pow(drfactor, scale);
-
         if (next->f[idx] < MGs->lbounds[k] || next->f[idx] > MGs->hbounds[k])
             return 0;
     }
-    for (unsigned int k = MGs->SIZE; k < PARAMETERS; k++)
-        next->f[RANDPOS + k] = 0.0;
-
     return 1;
 }
 
@@ -547,8 +601,8 @@ void broadcast_fast_covariance(double **cov_full, int worldsize) {
         for (int j = 0; j < N_FAST; j++)
             covFast[k][j] = cov_full[fast_idx[k]][fast_idx[j]];
     }
-    generateEigenvectors(MGfast, covFast, 1.0);
-
+    generateEigenvectors(MGfast, covFast, 1.0);  
+    
     static double packed[MAX_FAST_PACKED];
     packed[0] = (double)N_FAST;
     for (int k = 0; k < N_FAST; k++) packed[1+k] = MGfast->eigenvalues[k];
@@ -559,7 +613,7 @@ void broadcast_fast_covariance(double **cov_full, int worldsize) {
 
     for (int r = 1; r < worldsize; r++)
         MPI_Send(packed, p, MPI_DOUBLE, r, TAG_UPDATE_COV, MPI_COMM_WORLD);
-
+        
     for (int k = 0; k < N_FAST; k++) free(covFast[k]);
     free(covFast);
 }
@@ -567,13 +621,119 @@ void broadcast_fast_covariance(double **cov_full, int worldsize) {
 void update_local_fast_covariance(double *buf) {
     int n = (int)buf[0];
     if (n != N_FAST) return;
-
+    
     for (int k = 0; k < N_FAST; k++) fast_eval[k] = buf[1+k];
     int p = 1 + N_FAST;
     for (int i = 0; i < N_FAST; i++)
         for (int j = 0; j < N_FAST; j++)
             fast_evec[i][j] = buf[p++];
     fast_cov_ready = 1;
+}
+
+/* ---------------------------------------------------------------------
+ * Parse a file written by master() (covMatrix.txt) and return the LAST
+ * complete covariance matrix that appears in it, plus the "Entire
+ * factor" line that follows it.
+ *
+ * File format expected (one block):
+ *
+ *   Chain: <int> Step: <int> Points used: <int>
+ *   <row 0: n values separated by whitespace>
+ *   ...
+ *   <row n-1>
+ *   <blank line>
+ *   Entire factor: <value>
+ *   ***********************************************************
+ *
+ * Blocks are concatenated; the loader keeps the last COMPLETE one.
+ *
+ * Returns 1 on success, 0 on failure.
+ * --------------------------------------------------------------------- */
+static int load_covariance_from_file(const char *path, int n,
+                                     double **cov_out,
+                                     double *entire_factor_out) {
+    if (!path || n <= 0 || !cov_out) return 0;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "load_covariance: cannot open '%s'\n", path);
+        return 0;
+    }
+
+    /* Temporary accumulation buffer for the block currently being read */
+    double **tmp = (double**)malloc((size_t)n * sizeof(double*));
+    if (!tmp) { fclose(fp); return 0; }
+    for (int i = 0; i < n; i++) {
+        tmp[i] = (double*)malloc((size_t)n * sizeof(double));
+        if (!tmp[i]) {
+            for (int k = 0; k < i; k++) free(tmp[k]);
+            free(tmp);
+            fclose(fp);
+            return 0;
+        }
+    }
+
+    char line[8192];
+    int row       = 0;    /* rows collected for the current block       */
+    int in_block  = 0;    /* 1 after we see "Chain:"                    */
+    int have_mat  = 0;    /* 1 once at least one complete block committed */
+    double ef     = 1.0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* New block starts */
+        if (strncmp(line, "Chain:", 6) == 0) {
+            in_block = 1;
+            row = 0;
+            ef = 1.0;
+            continue;
+        }
+
+        /* End of a block: commit whatever rows we collected */
+        if (strncmp(line, "Entire factor:", 14) == 0) {
+            if (in_block && row == n) {
+                double v = 1.0;
+                if (sscanf(line, "Entire factor: %lf", &v) == 1) ef = v;
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < n; j++)
+                        cov_out[i][j] = tmp[i][j];
+                if (entire_factor_out) *entire_factor_out = ef;
+                have_mat = 1;
+            }
+            row = 0;
+            continue;
+        }
+
+        /* Skip separator and blank lines */
+        if (line[0] == '*' || line[0] == '\n' || line[0] == '\r')
+            continue;
+
+        if (in_block && row < n) {
+            double vals[512];
+            if (n > (int)(sizeof(vals)/sizeof(vals[0]))) break;
+            int cnt = 0;
+            const char *p = line;
+            while (*p && cnt < n) {
+                char *end;
+                double v = strtod(p, &end);
+                if (end == p) break;
+                vals[cnt++] = v;
+                p = end;
+            }
+            if (cnt == n) {
+                for (int j = 0; j < n; j++) tmp[row][j] = vals[j];
+                row++;
+            } else {
+                /* Malformed row — abandon this block */
+                row = 0;
+                in_block = 0;
+            }
+        }
+    }
+
+    fclose(fp);
+    for (int i = 0; i < n; i++) free(tmp[i]);
+    free(tmp);
+    return have_mat;
 }
 
 // =====================================================================
@@ -628,6 +788,30 @@ int master(double **startnum, unsigned short int Restart) {
     get_parameter_bounds_from_config(lowbound, highbound, initial_sigma);
     srand((unsigned)time(NULL));
 
+    /* ---------- Optional: load a saved covariance matrix ---------- */
+    int     have_loaded_cov = 0;
+    double **loaded_cov     = NULL;
+    double  loaded_ef       = 1.0;
+
+    if (LOAD_COV_PATH) {
+        loaded_cov = (double**)malloc(PARAMETERS * sizeof(double*));
+        for (int i = 0; i < PARAMETERS; i++)
+            loaded_cov[i] = (double*)malloc(PARAMETERS * sizeof(double));
+
+        if (load_covariance_from_file(LOAD_COV_PATH, PARAMETERS,
+                                      loaded_cov, &loaded_ef)) {
+            have_loaded_cov = 1;
+            printf("Loaded covariance from %s (EntireFactor = %g)\n",
+                   LOAD_COV_PATH, loaded_ef);
+        } else {
+            fprintf(stderr, "WARNING: could not load covariance from %s; "
+                            "falling back to diagonal\n", LOAD_COV_PATH);
+            for (int i = 0; i < PARAMETERS; i++) free(loaded_cov[i]);
+            free(loaded_cov);
+            loaded_cov = NULL;
+        }
+    }
+
     int intelligentstartnum = 1;
     for (int i = 0; i < CHAINS; i++) {
         roll[i] = new_RollingAverage(500);
@@ -644,14 +828,24 @@ int master(double **startnum, unsigned short int Restart) {
         for (int j = 0; j < PARAMETERS; j++) t.f[CURRENTSTATEPOS + j] = t.f[j];
 
         for (int j = 0; j < PARAMETERS; j++) sigma[i][j] = initial_sigma[j];
-        for (int k = 0; k < PARAMETERS; k++) for (int j = 0; j < PARAMETERS; j++)
-            covMatrix[i][k][j] = (j == k) ? sigma[i][k]*sigma[i][k] : 0.0;
 
-        generateEigenvectors(mGauss[i], covMatrix[i], 1.0);
+        if (have_loaded_cov) {
+            for (int k = 0; k < PARAMETERS; k++)
+                for (int j = 0; j < PARAMETERS; j++)
+                    covMatrix[i][k][j] = loaded_cov[k][j];
+            EntireFactor[i] = loaded_ef;
+        } else {
+            for (int k = 0; k < PARAMETERS; k++)
+                for (int j = 0; j < PARAMETERS; j++)
+                    covMatrix[i][k][j] = (j == k) ? sigma[i][k]*sigma[i][k] : 0.0;
+            EntireFactor[i] = 1.0;
+        }
+
+        generateEigenvectors(mGauss[i], covMatrix[i],
+                             EntireFactor[i]*EntireFactor[i]);
         steps_since_update[i] = 0;
-        EntireFactor[i] = 1.0;
 
-        t.f[LOGLIKEPOS] = -1e10;
+        t.f[LOGLIKEPOS] = -1e10;   // initial logL (will be overwritten by slave0)
         t.Multiplicity = 0;
         t.ReallyInvestigated = 0;
         if (Restart == 0) chainBack[i]++;
@@ -671,11 +865,24 @@ int master(double **startnum, unsigned short int Restart) {
         double **covSlow0 = (double**)malloc(N_SLOW * sizeof(double*));
         for (int k = 0; k < N_SLOW; k++) {
             covSlow0[k] = (double*)calloc(N_SLOW, sizeof(double));
-            covSlow0[k][k] = sigma[i][slow_idx[k]] * sigma[i][slow_idx[k]];
+            if (have_loaded_cov) {
+                for (int j = 0; j < N_SLOW; j++)
+                    covSlow0[k][j] = loaded_cov[slow_idx[k]][slow_idx[j]];
+            } else {
+                covSlow0[k][k] = sigma[i][slow_idx[k]] * sigma[i][slow_idx[k]];
+            }
         }
-        generateEigenvectors(mGaussSlow[i], covSlow0, 1.0);
+        generateEigenvectors(mGaussSlow[i], covSlow0,
+                             EntireFactor[i]*EntireFactor[i]);
         for (int k = 0; k < N_SLOW; k++) free(covSlow0[k]);
         free(covSlow0);
+    }
+
+    /* If we loaded a covariance, push the fast sub-block to the slaves so
+       dragging can start immediately. */
+    if (have_loaded_cov && USE_DRAGGING && N_FAST > 0) {
+        int worldsz; MPI_Comm_size(MPI_COMM_WORLD, &worldsz);
+        broadcast_fast_covariance(loaded_cov, worldsz);
     }
 
     // Open output files
@@ -705,12 +912,10 @@ int master(double **startnum, unsigned short int Restart) {
     MPI_Status status;
     double result[MAX_TASKARRAY_SIZE];
 
-    int mult[CHAINS][SLAVEPARCHAIN];
+    int mult[CHAINS];
     int tempi = 0, take = 0;
     unsigned int min_size = 100*100;
     int loopstop = 0;
-    double randq[MAX_TASKARRAY_SIZE], randq1[MAX_TASKARRAY_SIZE], randold;
-    int localpeakadjust;
     int global_step = 0;
 
     do {
@@ -718,62 +923,58 @@ int master(double **startnum, unsigned short int Restart) {
         MPI_Recv(result, TASKARRAY_SIZE, MPI_DOUBLE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
         if (status.MPI_TAG == GIVEMETASK) {
-            int i = (status.MPI_SOURCE - 1) / SLAVEPARCHAIN;
+            int i = status.MPI_SOURCE - 1;                    // SERIAL MODE: slave i ↔ chain i
             int use_dragging = (USE_DRAGGING && chainSize[i] >= BEGINCOVUPDATE) ? 1 : 0;
-            int num_proposals = USE_DR ? SLAVEPARCHAIN : 1;
-            total_proposals += num_proposals;
+            total_proposals += 1;
 
-            for (int ichains = 0; ichains < num_proposals; ichains++) {
-                mult[i][ichains] = 0;
-                next[i] = free_Task();
-                for (;;) {
-                    if (use_dragging) {
-                        if (throwSlowDice(chain[i][chainBack[i]-1], next[i], mGaussSlow[i], ichains)) break;
-                    } else {
-                        if (throwDice(chain[i][chainBack[i]-1], next[i], mGauss[i], ichains)) break;
-                    }
-                    mult[i][ichains]++;
-                    if (mult[i][ichains] > 100) {
-                        EntireFactor[i] *= 0.9;
-                        generateEigenvectors(mGauss[i], covMatrix[i], EntireFactor[i]*EntireFactor[i]);
-                        if (use_dragging) {
-                            double **covSlow = (double**)malloc(N_SLOW * sizeof(double*));
-                            for (int k = 0; k < N_SLOW; k++) {
-                                covSlow[k] = (double*)malloc(N_SLOW * sizeof(double));
-                                for (int j = 0; j < N_SLOW; j++)
-                                    covSlow[k][j] = covMatrix[i][slow_idx[k]][slow_idx[j]];
-                            }
-                            generateEigenvectors(mGaussSlow[i], covSlow, EntireFactor[i]*EntireFactor[i]);
-                            for (int k = 0; k < N_SLOW; k++) free(covSlow[k]);
-                            free(covSlow);
-                        }
-                        mult[i][ichains] = 0;
-                    }
-                    if (mult[i][ichains] > 100000) MPI_Abort(MPI_COMM_WORLD, 1);
+            mult[i] = 0;
+            next[i] = free_Task();
+            for (;;) {
+                if (use_dragging) {
+                    if (throwSlowDice(chain[i][chainBack[i]-1], next[i], mGaussSlow[i], 0)) break;
+                } else {
+                    if (throwDice(chain[i][chainBack[i]-1], next[i], mGauss[i], 0)) break;
                 }
-                for (int k = 0; k < PARAMETERS; k++)
-                    next[i]->f[CURRENTSTATEPOS + k] = chain[i][chainBack[i]-1].f[k];
-
-                next[i]->f[STEP_POS] = (double)global_step;
-                next[i]->f[PROBPOS] = posRnd(1.0);
-                next[i]->f[ADAPTIVEPOS] = (double)ADAPTIVE;
-                next[i]->f[DRAGPOS] = (double)use_dragging;
-                next[i]->f[FASTFACTORPOS] = fast_EntireFactor;
-                next[i]->f[TAKEPOS] = (double)ADAPTIVE;
-                next[i]->f[LOGLIKEPOS] = chain[i][chainBack[i]-1].f[LOGLIKEPOS];
-                next[i]->f[MULTIPURPOSEPOS] = (double)chain[i][chainBack[i]-1].ReallyInvestigated;
-
-                for (int k = 0; k < PARAMETERS; k++) fprintf(head[i], "%e\t", next[i]->f[k]);
-                fprintf(head[i], "\n");
-
-                int dest = myslave_rank(i) + ichains;
-                MPI_Send(next[i]->f, TASKARRAY_SIZE, MPI_DOUBLE, dest, TAKETASK, MPI_COMM_WORLD);
+                mult[i]++;
+                if (mult[i] > 100) {
+                    EntireFactor[i] *= 0.9;
+                    generateEigenvectors(mGauss[i], covMatrix[i], EntireFactor[i]*EntireFactor[i]);
+                    if (use_dragging) {
+                        double **covSlow = (double**)malloc(N_SLOW * sizeof(double*));
+                        for (int k = 0; k < N_SLOW; k++) {
+                            covSlow[k] = (double*)malloc(N_SLOW * sizeof(double));
+                            for (int j = 0; j < N_SLOW; j++)
+                                covSlow[k][j] = covMatrix[i][slow_idx[k]][slow_idx[j]];
+                        }
+                        generateEigenvectors(mGaussSlow[i], covSlow, EntireFactor[i]*EntireFactor[i]);
+                        for (int k = 0; k < N_SLOW; k++) free(covSlow[k]);
+                        free(covSlow);
+                    }
+                    mult[i] = 0;
+                }
+                if (mult[i] > 100000) MPI_Abort(MPI_COMM_WORLD, 1);
             }
+            for (int k = 0; k < PARAMETERS; k++)
+                next[i]->f[CURRENTSTATEPOS + k] = chain[i][chainBack[i]-1].f[k];
+
+            next[i]->f[STEP_POS]        = (double)global_step;
+            next[i]->f[PROBPOS]         = posRnd(1.0);
+            next[i]->f[ADAPTIVEPOS]     = (double)ADAPTIVE;
+            next[i]->f[DRAGPOS]         = (double)use_dragging;
+            next[i]->f[FASTFACTORPOS]   = fast_EntireFactor;
+            next[i]->f[TAKEPOS]         = (double)ADAPTIVE;
+            next[i]->f[LOGLIKEPOS]      = chain[i][chainBack[i]-1].f[LOGLIKEPOS];
+            next[i]->f[MULTIPURPOSEPOS] = (double)chain[i][chainBack[i]-1].ReallyInvestigated;
+
+            for (int k = 0; k < PARAMETERS; k++) fprintf(head[i], "%e\t", next[i]->f[k]);
+            fprintf(head[i], "\n");
+
+            int dest = myslave_rank(i);
+            MPI_Send(next[i]->f, TASKARRAY_SIZE, MPI_DOUBLE, dest, TAKETASK, MPI_COMM_WORLD);
         }
 
         if (status.MPI_TAG == TAKERESULT) {
-            if (SLAVEPARCHAIN > 1 && status.MPI_SOURCE % SLAVEPARCHAIN != 1) continue;
-            int i = (status.MPI_SOURCE - 1) / SLAVEPARCHAIN;
+            int i = status.MPI_SOURCE - 1;                    // SERIAL MODE: middleman = the slave
 
             for (int k = 0; k <= PARAMETERS; k++) fprintf(investigated[i], "%e  ", result[k]);
             fprintf(investigated[i], " %d\n", i);
@@ -796,6 +997,7 @@ int master(double **startnum, unsigned short int Restart) {
                             generateEigenvectors(mGauss[i], covMatrix[i], EntireFactor[i]*EntireFactor[i]);
                         }
 
+                // Rolling average update only here
                 if (ADAPTIVE == 1)
                     Rolling_Average_push(roll[i], pow(drfactor, (int)result[PROBPOS] - 1));
 
@@ -811,6 +1013,7 @@ int master(double **startnum, unsigned short int Restart) {
                 chain[i][chainBack[i]-1].ReallyInvestigated += 1;
             }
 
+            // ====== FIXED: covariance computation for all chains ======
             if (ADAPTIVE == 1 && steps_since_update[i] >= UPDATE_TIME && chainSize[i] >= BEGINCOVUPDATE) {
                 int TotalSize = 0;
                 unsigned int covSize[CHAINS];
@@ -851,6 +1054,7 @@ int master(double **startnum, unsigned short int Restart) {
                     for (int j = 0; j < PARAMETERS; j++)
                         cov[k][j] /= (TotalSize - 1.0);
 
+                // copy to each chain
                 for (int ii = 0; ii < CHAINS; ii++)
                     for (int k = 0; k < PARAMETERS; k++)
                         for (int j = 0; j < PARAMETERS; j++)
@@ -858,6 +1062,7 @@ int master(double **startnum, unsigned short int Restart) {
 
                 for (int ii = 0; ii < CHAINS; ii++) {
                     generateEigenvectors(mGauss[ii], cov, EntireFactor[ii]*EntireFactor[ii]);
+                    // also update slow proposal
                     double **covSlow = (double**)malloc(N_SLOW * sizeof(double*));
                     for (int k = 0; k < N_SLOW; k++) {
                         covSlow[k] = (double*)malloc(N_SLOW * sizeof(double));
@@ -884,6 +1089,7 @@ int master(double **startnum, unsigned short int Restart) {
 
                 for (int ii = 0; ii < CHAINS; ii++) steps_since_update[ii] = 0;
             }
+                  // END OF ADAPTIVE COVARIANCE
 
             if (ADAPTIVE == 1) {
                 if (chain[i][chainBack[i]-1].f[LOGLIKEPOS] < -1e9) {
@@ -988,7 +1194,7 @@ int master(double **startnum, unsigned short int Restart) {
                             double OptimalFactor = 2.4 / sqrt((double)PARAMETERS);
                             OptimalFactor = RollingAverage_average(roll[j]);
                             EntireFactor[j] = OptimalFactor;
-                            //if (EntireFactor[j] > 1.0) EntireFactor[j] = 0.2;
+                            // if (EntireFactor[j] > 1.0) EntireFactor[j] = 0.2;
                             fprintf(final, "CHAIN[%d] Eigenvector and value info: ", j);
                             fprintf(final, "************************************\n");
                             fprintf(final, "MultiGaussian::printInfo:\n");
@@ -1011,7 +1217,6 @@ int master(double **startnum, unsigned short int Restart) {
                         }
                         fclose(final);
                         fprintf(covarianceMatrices, "Stopped adaptive stepsize at %d for all chains (FREEZE_IN=true)", min_size);
-                        DEBUG_PRINT("Convergence reached at min_size=%d — freezing in.\n", min_size);
                     }
                 }
                 fprintf(progress, "Statistics: \n");
@@ -1033,7 +1238,7 @@ int master(double **startnum, unsigned short int Restart) {
                 }
             }
 
-            if (FREEZE_IN == 0) { loopstop++; DEBUG_PRINT("\n**** %d", loopstop); }
+            if (FREEZE_IN == 0) { loopstop++; }
             unsigned int max_size = 0;
             for (int ii = 0; ii < CHAINS; ii++) if (chainBack[ii] > max_size) max_size = chainBack[ii];
             if (max_size > MAXCHAINLENGTH || total_proposals > 2500000) work = 0;
@@ -1047,6 +1252,13 @@ int master(double **startnum, unsigned short int Restart) {
     fclose(progress); fclose(gelmanRubin); fclose(covarianceMatrices);
     for (int k = 1; k <= CHAINS; k++) {
         fclose(data[k-1]); fclose(head[k-1]); fclose(investigated[k-1]);
+    }
+
+    /* Release the loaded covariance */
+    if (loaded_cov) {
+        for (int i = 0; i < PARAMETERS; i++) free(loaded_cov[i]);
+        free(loaded_cov);
+        loaded_cov = NULL;
     }
 
     DEBUG_PRINT("\nMCMC finished. Sending stop signal to all slaves...\n");
@@ -1070,6 +1282,11 @@ double mind(double x, double y)
 
 // =====================================================================
 // HELPER: evaluate a single proposal (with emulator/dragging)
+// stores logL = -0.5*chi2 in task[LOGLIKEPOS]
+//
+// Option A: when dragging is ON, this function makes the FULL accept/reject
+// decision and writes task[TAKEPOS]. When dragging is OFF, it just evaluates
+// the proposal and leaves the decision to the slave.
 // =====================================================================
 static void evaluate_proposal(
     int rank,
@@ -1109,7 +1326,7 @@ static void evaluate_proposal(
             use_emu = 1;
     }
 
-    // ---- No dragging (standard MH) ----
+    // ---- No dragging: standard proposal evaluation only ----
     if (!use_dragging) {
         double cur_chi2 = -2.0 * task[LOGLIKEPOS];
         int really_inv = (int)task[MULTIPURPOSEPOS];
@@ -1153,7 +1370,7 @@ static void evaluate_proposal(
         return;
     }
 
-    // ---- Dragging ----
+    // ---- Dragging (Option A: full accept/reject decision here) ----
     double dummy = 0.0;
     double chi2_A_state, chi2_B_state;
     double cached_other_A = 0.0, cached_other_B = 0.0;
@@ -1171,6 +1388,9 @@ static void evaluate_proposal(
     }
 
     if (chi2_A_state < 1e29 && chi2_B_state < 1e29) {
+        // Save the chain state's chi2 BEFORE the drag loop overwrites it.
+        double chi2_A_original = chi2_A_state;
+
         double work_sum = chi2_B_state - chi2_A_state;
         double theta_f_path[MAX_TASKARRAY_SIZE] = {0};
         for (int k = 0; k < PARAMETERS; k++) theta_f_path[k] = theta_A[k];
@@ -1179,10 +1399,12 @@ static void evaluate_proposal(
             double w = (double)d / (double)N_DRAG;
             double trial[MAX_TASKARRAY_SIZE] = {0};
 
+            // slow parameters interpolated between A and B
             for (int k = 0; k < N_SLOW; k++) {
                 int idx = slow_idx[k];
                 trial[idx] = (1.0 - w) * theta_A[idx] + w * theta_B[idx];
             }
+            // fast parameters: from current theta_f_path (previous fast state)
             for (int k = 0; k < N_FAST; k++) {
                 int idx = fast_idx[k];
                 trial[idx] = theta_f_path[idx];
@@ -1211,6 +1433,7 @@ static void evaluate_proposal(
                     thA[k] = trial[k];
                     thB[k] = trial[k];
                 }
+                // enforce slow interpolation for both A and B endpoints of this segment
                 for (int k = 0; k < N_SLOW; k++) {
                     int idx = slow_idx[k];
                     thA[idx] = (1.0 - w) * theta_A[idx] + w * theta_B[idx];
@@ -1247,17 +1470,25 @@ static void evaluate_proposal(
         double alpha = (ln_alpha >= 0.0) ? 1.0 : exp(ln_alpha);
 
         if (posRnd(1.0) < alpha) {
+            // Drag ACCEPTED: chain moves to (y'', x_dragged)
             for (int k = 0; k < PARAMETERS; k++) task[k] = theta_f_path[k];
             for (int k = 0; k < N_SLOW; k++) task[slow_idx[k]] = theta_B[slow_idx[k]];
             final_chi2 = chi2_B_state;
             proposal_chi2 = chi2_B_state;
+            task[TAKEPOS] = 1.0;
         } else {
-            final_chi2 = chi2_B_state;
-            proposal_chi2 = chi2_B_state;
+            // Drag REJECTED: restore task[] to chain state.
+            for (int k = 0; k < PARAMETERS; k++) task[k] = theta_A[k];
+            final_chi2 = chi2_A_original;
+            proposal_chi2 = chi2_A_original;
+            task[TAKEPOS] = 0.0;
         }
     } else {
+        // Proposals outside prior or invalid; force reject.
+        for (int k = 0; k < PARAMETERS; k++) task[k] = theta_A[k];
         final_chi2 = 1e30;
         proposal_chi2 = 1e30;
+        task[TAKEPOS] = 0.0;
     }
 
     task[PARAMETERS] = proposal_chi2;
@@ -1267,7 +1498,9 @@ static void evaluate_proposal(
 }
 
 // =====================================================================
-// SLAVE – implements formal Delayed Rejection with all fixes
+// SLAVE – SERIAL MODE, one slave per chain.
+// Dragging: takes the decision already made inside evaluate_proposal.
+// Non-dragging: does standard MH.
 // =====================================================================
 int slave(int rank) {
     DEBUG_PRINT("\nI am from slave %d", rank);
@@ -1296,7 +1529,7 @@ int slave(int rank) {
     if (USE_EMULATOR && g_emulator == NULL) {
         EmulatorConfig emu_cfg = {
             .n_params = g_n_cosmo,
-            .buffer_capacity = 200,
+            .buffer_capacity = 500,
             .max_pca_modes = 40,
             .pca_interval = 500,
             .gp_interval = 50,
@@ -1315,37 +1548,28 @@ int slave(int rank) {
         }
     }
 
-    char progress_path[512];
-    snprintf(progress_path, sizeof(progress_path), "%s/progress_rank%d.log", outdir_buf, rank);
-    FILE *progress_file = fopen(progress_path, "w");
-    if (!progress_file) progress_file = stdout;
-
-    DEBUG_PRINT("\n"
-                "------------------------------------------------------------------------------------------------------------------------------\n"
-                " Rank  MCMC_step  Emu  Fallback  Uncertainty    chi2      logL       Omega_m    Omega_b       h        tau      n_s       A_s\n"
-                "------------------------------------------------------------------------------------------------------------------------------\n");
-    fflush(stdout);
-
-    int is_middleman = middleman(rank);
-    int chain_index = (rank - 1) / SLAVEPARCHAIN;
-
-    double loglike_current = -1.0e30;
-    unsigned short int takenindex = 0;
+    if (VERBOSE) {
+        printf("\n"
+               "------------------------------------------------------------------------------------------------------------------------------\n"
+               " Rank  MCMC_step  Emu  Fallback  Uncertainty    chi2      logL       Omega_m    Omega_b       h        tau      n_s       A_s\n"
+               "------------------------------------------------------------------------------------------------------------------------------\n");
+        fflush(stdout);
+    }
 
     for (;;) {
+        // Check stop signal
         MPI_Status probe_status;
         int flag = 0;
         MPI_Iprobe(0, TAG_STOP, MPI_COMM_WORLD, &flag, &probe_status);
         if (flag) {
             MPI_Recv(NULL, 0, MPI_INT, 0, TAG_STOP, MPI_COMM_WORLD, &probe_status);
-            if (progress_file && progress_file != stdout) fclose(progress_file);
             break;
         }
 
-        if (is_middleman) {
-            MPI_Send(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, GIVEMETASK, MPI_COMM_WORLD);
-        }
+        // Send request for a new task
+        MPI_Send(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, GIVEMETASK, MPI_COMM_WORLD);
 
+        // Receive covariance updates if any, then task
         for (;;) {
             MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
             if (status.MPI_TAG == TAG_UPDATE_COV) {
@@ -1357,8 +1581,11 @@ int slave(int rank) {
         }
         MPI_Recv(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, TAKETASK, MPI_COMM_WORLD, &status);
 
+        // Save current chain-state logL BEFORE evaluate_proposal overwrites LOGLIKEPOS
         double loglike_cur = task[LOGLIKEPOS];
+        int use_dragging = (int)task[DRAGPOS];
 
+        // Evaluate proposal (may also make the accept/reject decision for dragging)
         int use_emu = 0;
         double uncertainty = 0.0;
         evaluate_proposal(rank, task,
@@ -1367,161 +1594,86 @@ int slave(int rank) {
                           g_lowbound, g_highbound, g_sigma,
                           &use_emu, &uncertainty);
 
-        if (!is_middleman) {
-            MPI_Send(task, TASKARRAY_SIZE, MPI_DOUBLE, mymiddlemann(rank), TAKERESULT, MPI_COMM_WORLD);
-            continue;
-        }
-
-        // ---- Middleman: formal Delayed Rejection ----
-        double task_own[MAX_TASKARRAY_SIZE];
-        for (int k = 0; k < TASKARRAY_SIZE; k++) task_own[k] = task[k];
-
-        if (loglike_current < -1e29) {
-            loglike_current = loglike_cur;
-        }
-
-        takenindex = 0;
-        int accepted_stage = -1;
-
-        int dr_dim = (int)task_own[DRAGPOS] == 1 ? N_SLOW : PARAMETERS;
-
-        #define DR_MAX_STAGES 32
-        static double lp_stage[DR_MAX_STAGES + 1];
-        static double u_stage[DR_MAX_STAGES + 1][NOPARAM];
-        static double un_stage[DR_MAX_STAGES + 1];
-        static double A_dr[DR_MAX_STAGES + 1][DR_MAX_STAGES + 1];
-
-        int Kmax = SLAVEPARCHAIN;
-        if (Kmax > DR_MAX_STAGES) Kmax = DR_MAX_STAGES;
-
-        lp_stage[1] = task_own[LOGLIKEPOS];
-        for (int k = 0; k < dr_dim; k++) u_stage[1][k] = task_own[RANDPOS + k];
-        un_stage[1]  = task_own[PROBPOS];
-
-        A_dr[1][0] = mind(1.0, exp(lp_stage[1] - loglike_current));
-        A_dr[1][1] = 1.0;
-
-        if (un_stage[1] < A_dr[1][0]) {
-            takenindex = 1;
-            accepted_stage = 0;
-            loglike_current = lp_stage[1];
+        // ---- Accept / reject decision ----
+        int take;
+        if (use_dragging) {
+            // Option A: dragging already made the decision inside evaluate_proposal.
+            take = (int)task[TAKEPOS];
         } else {
-            for (int stage = 2; stage <= Kmax; stage++) {
-                double worker_task[MAX_TASKARRAY_SIZE];
-                MPI_Recv(worker_task, TASKARRAY_SIZE, MPI_DOUBLE,
-                         myslave_rank(chain_index) + (stage - 1), TAKERESULT,
-                         MPI_COMM_WORLD, &status);
+            // Standard MH.
+            double loglike_prop = task[LOGLIKEPOS];
+            double alpha = mind(1.0, exp(loglike_prop - loglike_cur));
+            take = (posRnd(1.0) < alpha) ? 1 : 0;
 
-                lp_stage[stage] = worker_task[LOGLIKEPOS];
-                for (int k = 0; k < dr_dim; k++) u_stage[stage][k] = worker_task[RANDPOS + k];
-                un_stage[stage] = worker_task[PROBPOS];
-
-                for (int m = 1; m < stage; m++) {
-                    double lp_diff = lp_stage[m] - lp_stage[stage];
-
-                    double log_q = 0.0;
-                    for (int mp = 1; mp < m; mp++) {
-                        double d_m = 0.0, d_stage = 0.0;
-                        for (int k = 0; k < dr_dim; k++) {
-                            double diff_m     = u_stage[mp][k] - u_stage[m][k];
-                            double diff_stage = u_stage[mp][k] - u_stage[stage][k];
-                            d_m     += diff_m * diff_m;
-                            d_stage += diff_stage * diff_stage;
-                        }
-                        double gamma_sq = pow(drfactor, 2.0 * (mp - 1));
-                        log_q += -0.5 / gamma_sq * (d_m - d_stage);
-                    }
-
-                    double log_corr = 0.0;
-                    int ok = 1;
-                    for (int mp = 1; mp < m; mp++) {
-                        double den = 1.0 - A_dr[mp][stage];
-                        if (den <= 1e-15) { ok = 0; break; }
-                        log_corr += log(1.0 - A_dr[mp][m]) - log(den);
-                    }
-                    if (!ok) { A_dr[m][stage] = 0.0; continue; }
-
-                    double la = lp_diff + log_q + log_corr;
-                    A_dr[m][stage] = (la >= 0.0) ? 1.0 : exp(la);
-                }
-
-                double lp_diff_0 = lp_stage[stage] - loglike_current;
-
-                double log_q0 = 0.0;
-                for (int mp = 1; mp < stage; mp++) {
-                    double d_stage_0 = 0.0, d_0 = 0.0;
-                    for (int k = 0; k < dr_dim; k++) {
-                        double diff_stage_0 = u_stage[mp][k] - u_stage[stage][k];
-                        double diff_0       = u_stage[mp][k];
-                        d_stage_0 += diff_stage_0 * diff_stage_0;
-                        d_0       += diff_0 * diff_0;
-                    }
-                    double gamma_sq = pow(drfactor, 2.0 * (mp - 1));
-                    log_q0 += -0.5 / gamma_sq * (d_stage_0 - d_0);
-                }
-
-                double log_corr0 = 0.0;
-                int ok = 1;
-                for (int mp = 1; mp < stage; mp++) {
-                    double den = 1.0 - A_dr[mp][0];
-                    if (den <= 1e-15) { ok = 0; break; }
-                    log_corr0 += log(1.0 - A_dr[mp][stage]) - log(den);
-                }
-                if (!ok) { A_dr[stage][0] = 0.0; continue; }
-
-                double la = lp_diff_0 + log_q0 + log_corr0;
-                A_dr[stage][0] = (la >= 0.0) ? 1.0 : exp(la);
-
-                if (un_stage[stage] < A_dr[stage][0]) {
-                    takenindex = 1;
-                    accepted_stage = stage - 1;
-                    loglike_current = lp_stage[stage];
-                    for (int k = 0; k < TASKARRAY_SIZE; k++) task[k] = worker_task[k];
-                    break;
-                }
+            // On reject, restore the chain state in task[].
+            if (take == 0) {
+                for (int k = 0; k < PARAMETERS; k++)
+                    task[k] = task[CURRENTSTATEPOS + k];
+                task[LOGLIKEPOS] = loglike_cur;
+                task[PARAMETERS] = -2.0 * loglike_cur;
             }
         }
 
-        if (takenindex == 1) {
-            task[PROBPOS] = (double)(accepted_stage + 1);
-            task[TAKEPOS] = 1.0;
+        task[TAKEPOS] = (double)take;
+        task[PROBPOS] = (take == 1) ? 1.0 : 0.0;
 
-            if (g_emulator) {
-                double *Cl_TT_true = (double*)malloc(2601 * sizeof(double));
-                double *Cl_TE_true = (double*)malloc(2601 * sizeof(double));
-                double *Cl_EE_true = (double*)malloc(2601 * sizeof(double));
-                double *Cl_BB_true = (double*)malloc(2601 * sizeof(double));
-                if (Cl_TT_true && Cl_TE_true && Cl_EE_true && Cl_BB_true) {
-                    if (param_iface(rank, task, Cl_TT_true, Cl_TE_true, Cl_EE_true, Cl_BB_true)) {
-                        double true_logL = task[LOGLIKEPOS];
-                        double cosmo_final[N_SLOW];
-                        for (int k = 0; k < N_SLOW; k++) cosmo_final[k] = task[slow_idx[k]];
-                        emulator_update(g_emulator, local_step++, cosmo_final,
-                                        Cl_TT_true, Cl_TE_true, Cl_EE_true, Cl_BB_true, true_logL);
+        // Emulator update: on accepted point only, using true CAMB Cl's.
+        // Ownership of the Cl arrays transfers to the training buffer on
+        // successful emulator_update; only free them ourselves if the
+        // hand-off did NOT happen.
+        if (take && g_emulator) {
+            double *Cl_TT_true = (double*)malloc(2601 * sizeof(double));
+            double *Cl_TE_true = (double*)malloc(2601 * sizeof(double));
+            double *Cl_EE_true = (double*)malloc(2601 * sizeof(double));
+            double *Cl_BB_true = (double*)malloc(2601 * sizeof(double));
+
+            if (Cl_TT_true && Cl_TE_true && Cl_EE_true && Cl_BB_true) {
+                if (param_iface(rank, task, Cl_TT_true, Cl_TE_true, Cl_EE_true, Cl_BB_true)) {
+                    double true_logL = task[LOGLIKEPOS];
+                    double cosmo_final[N_SLOW];
+                    for (int k = 0; k < N_SLOW; k++)
+                        cosmo_final[k] = task[slow_idx[k]];
+
+                    /* 1 = buffer took ownership (do NOT free here).
+                       0 = buffer refused    (caller still owns; free below). */
+                    int taken = emulator_update(g_emulator, local_step++, cosmo_final,
+                                                Cl_TT_true, Cl_TE_true,
+                                                Cl_EE_true, Cl_BB_true, true_logL);
+
+                    if (!taken) {
+                        free(Cl_TT_true); free(Cl_TE_true);
+                        free(Cl_EE_true); free(Cl_BB_true);
                     }
-                    free(Cl_TT_true); free(Cl_TE_true); free(Cl_EE_true); free(Cl_BB_true);
+                    /* if taken: buffer owns them and will free them only when
+                       the circular slot wraps, or on emulator_free(). */
+                } else {
+                    /* param_iface failed — buffer never saw them, so free here. */
+                    free(Cl_TT_true); free(Cl_TE_true);
+                    free(Cl_EE_true); free(Cl_BB_true);
                 }
+            } else {
+                /* Partial allocation — free whatever succeeded. */
+                free(Cl_TT_true); free(Cl_TE_true);
+                free(Cl_EE_true); free(Cl_BB_true);
             }
-        } else {
-            task[PROBPOS] = 0.0;
-            task[TAKEPOS] = 0.0;
         }
 
+        // Force emulator training if buffer full
         if (g_emulator && !emulator_is_ready(g_emulator) && emulator_buffer_size(g_emulator) >= 200) {
             DEBUG_PRINT("Rank %d: Forcing emulator training.\n", rank);
             emulator_train(g_emulator);
         }
 
-        int mcmc_step = (int)task[STEP_POS];
-        double chi2_to_print = -2.0 * task[LOGLIKEPOS];
-        double logL_to_print = task[LOGLIKEPOS];
-        int max_print = (g_n_cosmo < 6) ? g_n_cosmo : 6;
-        double *params_to_print = task;
+        // Progress print (only if verbose)
         if (VERBOSE) {
+            int mcmc_step = (int)task[STEP_POS];
+            double chi2_to_print = -2.0 * task[LOGLIKEPOS];
+            double logL_to_print = task[LOGLIKEPOS];
+            int max_print = (g_n_cosmo < 6) ? g_n_cosmo : 6;
             printf(" %2d     %6d    %1d      %1d     %8.4e   %8.2f %8.2f   ",
                    rank, mcmc_step, use_emu, (!use_emu), uncertainty,
                    chi2_to_print, logL_to_print);
-            for (int i = 0; i < max_print; i++) printf("%8.4f ", params_to_print[i]);
+            for (int i = 0; i < max_print; i++) printf("%8.4f ", task[i]);
             for (int i = max_print; i < 6; i++) printf("%8s ", " ");
             printf("\n");
             fflush(stdout);
@@ -1530,27 +1682,19 @@ int slave(int rank) {
         MPI_Send(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, TAKERESULT, MPI_COMM_WORLD);
     }
 
-    if (progress_file && progress_file != stdout) fclose(progress_file);
+    // Cleanup
     free(Cl_TT_A); free(Cl_TE_A); free(Cl_EE_A); free(Cl_BB_A);
     free(Cl_TT_B); free(Cl_TE_B); free(Cl_EE_B); free(Cl_BB_B);
     return 0;
 }
 
-int slave0(int rank,int runperchain)
+
+int slave0(int rank,int runperchain) 
 {
   MPI_Status  status;
-  char inputfilename[30],command[500];
   double *task;
   double Chi2X;
-  double ratio;
-  FILE *fplens;
-  int lfile;
-  double loglike = -1.0e30;
-  unsigned short int takenindex = 0,take =0;
-  int magicnum1,magicnum2;
-  char cfplens[100];
-  double alpha12,alpha32,alpha13,l2,q1,newss;
-
+  int magicnum1;
   int l_max_alloc = 3000;
   double *Cl_TT = (double*)malloc((l_max_alloc + 1) * sizeof(double));
   double *Cl_TE = (double*)malloc((l_max_alloc + 1) * sizeof(double));
@@ -1565,10 +1709,8 @@ int slave0(int rank,int runperchain)
   task = new_double(PARAMETERS+1);
 
   DEBUG_PRINT("My rank is here %d",rank);
-  int cnt = 0;
   for (int i=0;i<runperchain;i++)
     {
-
       DEBUG_PRINT("\nThis is a test\n");
       MPI_Recv(task,PARAMETERS+1,MPI_DOUBLE,0,200,MPI_COMM_WORLD,&status);
 
@@ -1593,8 +1735,6 @@ int slave0(int rank,int runperchain)
       if (WMAP7 == 1)
         task[PARAMETERS] = Chi2X;
 
-      DEBUG_PRINT("\nChisquare is (%d): %e",rank,Chi2X);
-
       for (unsigned int k = 0;k < PARAMETERS+1; k++)
         {
           if (isnan(task[k]))
@@ -1605,9 +1745,6 @@ int slave0(int rank,int runperchain)
             }
         }
 
-      DEBUG_PRINT("\n\nThis is :\n\n");
-      DEBUG_PRINT("\nI will now send : %e",task[PARAMETERS]);
-      fflush(stdout);
       MPI_Send(task,PARAMETERS+1, MPI_DOUBLE,0,201,MPI_COMM_WORLD);
     }
     free(Cl_TT); free(Cl_TE); free(Cl_EE); free(Cl_BB);
@@ -1639,36 +1776,29 @@ double **master0(int worldsize, int runperchain)
 
   for (int i = 0; i < 100; i++)
   {
-    DEBUG_PRINT("\n %d) ", i);
     for (int j = 0; j <= PARAMETERS; j++)
     {
       startval[i][j] = lowbound[j] + posRnd(highbound[j] - lowbound[j]);
-      DEBUG_PRINT("%e   ", startval[i][j]);
     }
   }
   double *startvaltemp;
 
   startvaltemp = new_double(PARAMETERS + 1);
 
-  DEBUG_PRINT("Hi I am here");
-
   int slavenumber = worldsize / runperchain;
 
   for (int i = 0; i < runperchain; i++)
   {
-    DEBUG_PRINT("\nSending Now : %d %d", runperchain, worldsize);
     for (int j = 0; j < worldsize / runperchain; j++)
       MPI_Send(startval[i + j * runperchain], PARAMETERS + 1, MPI_DOUBLE, j + 1, 200, MPI_COMM_WORLD);
     for (int j = 0; j < worldsize / runperchain; j++)
     {
       MPI_Recv(startvaltemp, PARAMETERS + 1, MPI_DOUBLE, MPI_ANY_SOURCE, 201, MPI_COMM_WORLD, &status);
-      DEBUG_PRINT("Recv from %d %d", status.MPI_SOURCE, runperchain);
       for (int k = 0; k <= PARAMETERS; k++)
       {
         startval[i + (status.MPI_SOURCE - 1) * runperchain][k] = startvaltemp[k];
       }
     }
-    DEBUG_PRINT("I am now here : %d ", runperchain);
   }
 
   int temparrange[100];
@@ -1707,11 +1837,9 @@ double **master0(int worldsize, int runperchain)
 
   for (int i = 0; i < CHAINS; i++)
   {
-    DEBUG_PRINT("\n");
     for (int j = 0; j <= PARAMETERS; j++)
     {
       startvalfinal[i][j] = startval[temparrange[i]][j];
-      DEBUG_PRINT("%e  ", startvalfinal[i][j]);
     }
   }
 
@@ -1735,6 +1863,7 @@ void classify_parameters(void) {
         }
     }
 }
+
 
 void setVariables() {
     if(!load_config("param.ini", &global_config)) {
@@ -1768,8 +1897,8 @@ void setVariables() {
     TASKARRAY_SIZE  = CURRENTSTATEPOS + PARAMETERS;
 
     if (TASKARRAY_SIZE > MAX_TASKARRAY_SIZE) {
-        fprintf(stderr, "ERROR: TASKARRAY_SIZE (%d) exceeds MAX_TASKARRAY_SIZE (%d).\n",
-                TASKARRAY_SIZE, MAX_TASKARRAY_SIZE);
+        printf("ERROR: TASKARRAY_SIZE (%d) exceeds MAX_TASKARRAY_SIZE (%d).\n",
+               TASKARRAY_SIZE, MAX_TASKARRAY_SIZE);
         exit(1);
     }
 
@@ -1786,13 +1915,14 @@ int main(int argc, char *argv[]) {
     unsigned short int Restart = 0;
     const char *outdir_default = ".";
     const char *outdir = outdir_default;
+    const char *load_cov_path = NULL;
 
     // Parse flags
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-restart") == 0) Restart = 1;
         else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) outdir = argv[++i];
-        else if (strcmp(argv[i], "-dr") == 0) USE_DR = 1;
-        else if (strcmp(argv[i], "-no-dr") == 0) USE_DR = 0;
+        else if (strcmp(argv[i], "-load-cov") == 0 && i+1 < argc)
+            load_cov_path = argv[++i];
         else if (strcmp(argv[i], "-emu") == 0) USE_EMULATOR = 1;
         else if (strcmp(argv[i], "-no-emu") == 0) USE_EMULATOR = 0;
         else if (strcmp(argv[i], "-drag") == 0) USE_DRAGGING = 1;
@@ -1801,22 +1931,22 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "-no-print") == 0) VERBOSE = 0;
         else {
             if (myrank == 0) {
-                printf("Usage: %s [-restart] [-o output_dir] [-dr | -no-dr] [-emu | -no-emu] [-drag | -no-drag] [-print | -no-print]\n", argv[0]);
+                printf("Usage: %s [-restart] [-o output_dir] "
+                       "[-load-cov cov_file] "
+                       "[-emu | -no-emu] [-drag | -no-drag] "
+                       "[-print | -no-print]\n", argv[0]);
             }
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
 
-    if (USE_DR == 0) {
-        SLAVEPARCHAIN = 1;
-        if (myrank == 0) DEBUG_PRINT("Delayed rejection disabled: Setting SLAVEPARCHAIN = 1.\n");
-    }
+    LOAD_COV_PATH = load_cov_path;
 
-    // FIXED: process-count guard
+    // SERIAL MODE: exactly one slave per chain
     int expected_ranks = 1 + CHAINS * SLAVEPARCHAIN;
     if (worldsize != expected_ranks) {
         if (myrank == 0) {
-            fprintf(stderr, "ERROR: need exactly %d MPI ranks (1 master + %d chains * %d slaves per chain).\n",
+            fprintf(stderr, "ERROR: need exactly %d MPI ranks (1 master + %d chains * %d slave per chain).\n",
                     expected_ranks, CHAINS, SLAVEPARCHAIN);
         }
         MPI_Abort(MPI_COMM_WORLD, 1);
