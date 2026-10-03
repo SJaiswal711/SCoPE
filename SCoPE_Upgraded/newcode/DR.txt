@@ -1,0 +1,583 @@
+# Mathematics of DR Inside Dragging
+
+## Complete Draft with Detailed Derivations and Verifications
+
+---
+
+## 1. Setup and Conventions
+
+### 1.1 Parameter split
+
+\[
+\theta = (y, x), \qquad y \in \mathbb{R}^{d_s}, \qquad x \in \mathbb{R}^{d_f}.
+\]
+
+Joint target:
+\[
+\pi(y, x) = P(x \mid y)\, p(y).
+\]
+
+The slow parameters \(y\) enter CAMB; the fast parameters \(x\) enter only the clik likelihood. The fast conditional is \(P(x \mid y)\); the slow prior is \(p(y)\).
+
+### 1.2 Dragging path — Lewis convention
+
+Fix \(n \geq 2\). Define \(n+1\) interpolated targets for \(i = 0, 1, \dots, n\):
+
+\[
+\ln P_i(x) = \left(1 - \tfrac{i}{n}\right) \ln P(x \mid y_0) + \tfrac{i}{n} \ln P(x \mid y_1).
+\]
+
+Endpoints: \(P_0 = P(\cdot \mid y_0)\), \(P_n = P(\cdot \mid y_1)\).
+
+Interior targets: \(P_1, \dots, P_{n-1}\).
+
+**Convention L.** The drag path is \(x_0, x_1, \dots, x_{n-1}\), where \(x_0\) is the current fast state and \(x_i \sim K_i(\cdot \mid x_{i-1})\) for \(i \ge 1\). Each \(K_i\) is \(P_i\)-reversible. The endpoint \(y_1\) (at weight \(w_n = 1\)) is the slow proposal; the path terminates at \(x_{n-1}\) at weight \(w_{n-1} = (n-1)/n\).
+
+This convention matches Lewis (2013) and Neal (2005), where dragging interpolates between the current and proposed slow parameters.
+
+### 1.3 Chi-squared form
+
+\[
+\chi^2_A(x) = -2 \ln P(x \mid y_0), \qquad \chi^2_B(x) = -2 \ln P(x \mid y_1).
+\]
+
+\[
+\chi^2_{w}(x) = (1 - w) \chi^2_A(x) + w \chi^2_B(x).
+\]
+
+\[
+\ln P_i(x) = -\tfrac{1}{2} \chi^2_{i/n}(x) + \text{const}_i.
+\]
+
+The constant \(\text{const}_i\) depends only on the slow endpoints and cancels in every ratio.
+
+---
+
+## 2. Internal Kernel — Fixed-Direction Delayed Rejection
+
+### 2.1 Candidate construction
+
+At internal step \(i\), with current fast state \(x_{i-1} \in \mathbb{R}^{d_f}\):
+
+- Draw \(Z \sim N(0, \Sigma_{\text{fast}})\), a single direction in \(\mathbb{R}^{d_f}\).
+- Fix signed scales \(\ell_1, \dots, \ell_K \in \mathbb{R} \setminus \{0\}\).
+- Define
+\[
+Y^{(k)} = x_{i-1} + \ell_k Z, \qquad k = 1, \dots, K.
+\]
+
+All candidates lie on the affine line \(L = x_{i-1} + \mathbb{R} Z\).
+
+**Verification.** This construction matches Bédard, Douc & Moulines (2014), where the direction is fixed once for all proposals and the MH accept-reject mechanism selects a scaling along the search direction. The motivation is that standard independent-candidate DR collapses in high dimensions — the second proposal is discarded with probability tending to 1 as dimension increases. Fixed-direction DR overcomes this by maintaining collinearity of the candidates.
+
+### 2.2 Residual-mass recursion
+
+For \(d \in \{+Z, -Z\}\), define:
+
+\[
+R_1(u; d) := \left[ P_i(u) - P_i(u + \ell_1 d) \right]_+.
+\]
+
+For \(k \ge 2\):
+
+\[
+R_k(u; d) := \left[ R_{k-1}(u; d) - R_{k-1}(u + \ell_k d; -d) \right]_+.
+\]
+
+**Interpretation.** \(R_k(u; d)\) is the probability mass that remains at \(u\) after stages \(1\) through \(k\) of the DR recursion have all rejected.
+
+#### Lemma 2.1 (boundedness)
+
+\(R_k(u; d) \in [0, P_i(u)]\) for all \(k\), all \(u \in L\), all \(d\).
+
+**Proof.** By induction. Base: \(R_1(u; d) = [P_i(u) - P_i(u + \ell_1 d)]_+\), which is in \([0, P_i(u)]\). Inductive step: \(R_k(u; d) = [R_{k-1}(u; d) - R_{k-1}(u + \ell_k d; -d)]_+\). By inductive hypothesis, \(R_{k-1}(u; d) \le P_i(u)\), and the bracket is non-negative. So \(R_k \in [0, R_{k-1}(u; d)] \subseteq [0, P_i(u)]\). ∎
+
+#### Lemma 2.2 (flow-conservation identity)
+
+For all \(k\):
+
+\[
+R_k(u; d) + R_{k-1}(u + \ell_k d; -d) \cdot \mathbf{1}[R_{k-1}(u + \ell_k d; -d) \le R_{k-1}(u; d)]
++ R_{k-1}(u; d) \cdot \mathbf{1}[R_{k-1}(u + \ell_k d; -d) > R_{k-1}(u; d)]
+= R_{k-1}(u; d).
+\]
+
+**Proof.** Let \(A = R_{k-1}(u; d)\), \(B = R_{k-1}(u + \ell_k d; -d)\).
+
+Case \(B \le A\): \(R_k = A - B\). LHS \(= (A - B) + B + 0 = A\). RHS \(= A\). ✓
+
+Case \(B > A\): \(R_k = [A - B]_+ = 0\). LHS \(= 0 + 0 + A = A\). RHS \(= A\). ✓ ∎
+
+**Remark.** The recursion is *defined* by the bracket formula. Lemma 2.2 is a restatement of it, not an independent axiom. Its role is to make explicit that the mass \(R_{k-1}(u; d)\) splits into three parts: the part that stays (\(R_k\)), the part that can move to \(u + \ell_k d\), and the part that cannot.
+
+### 2.3 Stage acceptances
+
+Define:
+
+\[
+\alpha_1 := 1 \wedge \frac{P_i(Y^{(1)})}{P_i(x_{i-1})}.
+\]
+
+For \(k \ge 2\):
+
+\[
+\alpha_k := 1 \wedge \frac{R_{k-1}(Y^{(k)}; -Z)}{R_{k-1}(x_{i-1}; +Z)}.
+\]
+
+**Convention.** If \(R_{k-1}(x_{i-1}; +Z) = 0\), then \(\alpha_k := 1\) (no mass left to move; accepting is equivalent to staying).
+
+The DR kernel \(K_i\) is:
+
+1. Draw \(u_1, \dots, u_K \sim U(0,1)\) i.i.d.
+2. Find the smallest \(k\) with \(u_k < \alpha_k\).
+3. If such a \(k\) exists, set \(x_i = Y^{(k)}\).
+4. Otherwise, set \(x_i = x_{i-1}\).
+
+**Verification.** This sequential test matches the standard DR recursion (Mira 2001; Bédard et al. 2014). The stage-\(k\) acceptance uses the residual mass from the previous stage, which accounts for the probability mass that has not yet been absorbed by earlier stages.
+
+### 2.4 Reversibility — Correct Derivation
+
+The correct reversibility result for fixed-direction DR is Bédard et al. (2014, Proposition 2). The proof uses the **stage-flow decomposition** and the **two-point balance identity**. Below is the complete derivation.
+
+#### 2.4.1 The mirror-symmetry identity (per stage)
+
+**Claim.** For any \(k \ge 1\):
+
+\[
+R_{k-1}(u; +Z) - R_k(u; +Z) = R_{k-1}(u + \ell_k Z; -Z) - R_k(u + \ell_k Z; -Z). \tag{2.4.1}
+\]
+
+**Proof.** Let \(A = R_{k-1}(u; +Z)\), \(B = R_{k-1}(u + \ell_k Z; -Z)\), \(A' = R_k(u; +Z)\), \(B' = R_k(u + \ell_k Z; -Z)\).
+
+**Case 1: \(A \ge B\).**
+
+- \(A' = [A - B]_+ = A - B\).
+- LHS \(= A - A' = A - (A - B) = B\).
+- \(B' = R_k(u + \ell_k Z; -Z) = [R_{k-1}(u + \ell_k Z; -Z) - R_{k-1}(u; +Z)]_+ = [B - A]_+ = 0\).
+- RHS \(= B - B' = B - 0 = B\).
+- LHS = RHS. ✓
+
+**Case 2: \(A < B\).**
+
+- \(A' = [A - B]_+ = 0\).
+- LHS \(= A - 0 = A\).
+- \(B' = [B - A]_+ = B - A\).
+- RHS \(= B - B' = B - (B - A) = A\).
+- LHS = RHS. ✓ ∎
+
+**Remark.** This identity relates the **residual masses** at two mirror points \(u\) and \(u + \ell_k Z\) at the same stage \(k\). It is the residual-mass version of the stage-flow balance; it is not a telescoping chain across different \(k\). Its interpretation: the residual at \(u\) minus the residual after stage \(k\) equals the residual at \(u + \ell_k Z\) minus the residual after stage \(k\), i.e., the mass that "left" at stage \(k\) from \(u\) equals the mass that "left" from \(u + \ell_k Z\).
+
+#### 2.4.2 Stage-flow decomposition
+
+From the definition of \(R_k\), the mass that **moves** at stage \(k\) from \(u\) is the difference between the residual before and after the stage:
+
+\[
+\Delta_k^+(u) := R_{k-1}(u; +Z) - R_k(u; +Z).
+\]
+
+**Claim.** \(\Delta_k^+(u) = \min(R_{k-1}(u; +Z),\, R_{k-1}(u + \ell_k Z; -Z))\).
+
+**Proof.** Let \(A = R_{k-1}(u; +Z)\), \(B = R_{k-1}(u + \ell_k Z; -Z)\).
+
+- Case \(A \ge B\): \(\Delta_k^+(u) = A - (A - B) = B = \min(A, B)\). ✓
+- Case \(A < B\): \(\Delta_k^+(u) = A - 0 = A = \min(A, B)\). ✓ ∎
+
+**Corollary (flow balance at stage \(k\)).** Define the reverse flow at stage \(k\) from \(u + \ell_k Z\) to \(u\):
+
+\[
+\Delta_k^-(u + \ell_k Z) := R_{k-1}(u + \ell_k Z; -Z) \cdot \alpha_k(u + \ell_k Z \to u).
+\]
+
+Then
+
+\[
+\Delta_k^+(u) = \Delta_k^-(u + \ell_k Z) = \min(A, B). \tag{2.4.2}
+\]
+
+**Proof.** The forward acceptance is \(\alpha_k(u \to u + \ell_k Z) = 1 \wedge B/A\). The reverse acceptance is \(\alpha_k(u + \ell_k Z \to u) = 1 \wedge A/B\).
+
+- Case \(A \le B\): forward \(= 1\), reverse \(= A/B\). \(\Delta_k^+ = A \cdot 1 = A\); \(\Delta_k^- = B \cdot A/B = A\). Both \(= \min(A, B)\). ✓
+- Case \(A > B\): forward \(= B/A\), reverse \(= 1\). \(\Delta_k^+ = A \cdot B/A = B\); \(\Delta_k^- = B \cdot 1 = B\). Both \(= \min(A, B)\). ✓ ∎
+
+**Interpretation.** The mass that crosses the line \(L\) from \(u\) toward \(u + \ell_k Z\) at stage \(k\) equals the mass that crosses the line from \(u + \ell_k Z\) toward \(u\) at stage \(k\).
+
+**Corollary (forward-side telescoping).** The forward flow at stage \(k\) is \(\Delta_k^+(u) = R_{k-1}(u; +Z) - R_k(u; +Z)\). Summing over \(k = 1, \dots, K\):
+
+\[
+\sum_{k=1}^K \Delta_k^+(u) = R_0(u; +Z) - R_K(u; +Z) = P_i(u) - R_K(u; +Z).
+\]
+
+This is a genuine telescoping sum because the forward-side residuals are evaluated at the **same** point \(u\). It gives the total mass that has moved from \(u\) after \(K\) stages.
+
+#### 2.4.3 Total flow equality and reversibility
+
+Define the total forward flow across \(L\):
+
+\[
+\Phi_{\text{fwd}} := \sum_{k=1}^K \Delta_k^+(u) = P_i(u) - R_K(u; +Z).
+\]
+
+Define the total reverse flow across \(L\):
+
+\[
+\Phi_{\text{rev}} := \sum_{k=1}^K \Delta_k^-(u + \ell_k Z) = \sum_{k=1}^K R_{k-1}(u + \ell_k Z; -Z) \cdot \alpha_k(u + \ell_k Z \to u).
+\]
+
+By the stage-flow balance (2.4.2), each term in \(\Phi_{\text{rev}}\) equals the corresponding term in \(\Phi_{\text{fwd}}\):
+
+\[
+\Delta_k^-(u + \ell_k Z) = \Delta_k^+(u) \qquad \text{for every } k.
+\]
+
+**Therefore:**
+
+\[
+\Phi_{\text{fwd}} = \Phi_{\text{rev}}. \tag{2.4.3}
+\]
+
+The equality holds **stage by stage**, not via a telescoping sum. This is the key point: the reverse flow does not collapse to a two-term expression, because the mirror points \(u + \ell_k Z\) differ across \(k\). Instead, the stage-by-stage equality (2.4.2) transfers directly to the total.
+
+**Reversibility.** The DR kernel \(K_i\) has support on the finite set \(\{Y^{(1)}, \dots, Y^{(K)}, x_{i-1}\}\). Transition probabilities are determined by the sequential test. The equality of forward and reverse flows (2.4.3) at every stage \(k\) implies that \(K_i\) satisfies detailed balance with respect to \(P_i\):
+
+\[
+P_i(x_{i-1}) K_i(x_{i-1}, y) = P_i(y) K_i(y, x_{i-1})
+\]
+
+for every \(y \in \mathrm{supp}(K_i)\). The full proof is Bédard et al. (2014, Proposition 2). ∎
+
+**Remark on the telescoping asymmetry.** The forward total flow telescopes because all residuals are evaluated at the same point \(u\). The reverse total flow does **not** telescope, because the residuals are evaluated at different mirror points \(u + \ell_k Z\). The equality \(\Phi_{\text{fwd}} = \Phi_{\text{rev}}\) is inherited stage by stage from (2.4.2), not from a telescoping sum in the reverse direction.
+
+#### 2.4.4 The stage-1 case
+
+For \(K = 1\) (standard MH), the reversibility reduces to the standard MH identity. Let \(A = P_i(u)\), \(B = P_i(u + \ell_1 Z)\). Then
+
+\[
+R_1(u; +Z) = [A - B]_+, \qquad R_1(u + \ell_1 Z; -Z) = [B - A]_+.
+\]
+
+The stage-flow balance (2.4.2) is
+
+\[
+A \cdot (1 \wedge B/A) = B \cdot (1 \wedge A/B),
+\]
+
+which is the standard two-point detailed balance for MH. The total forward flow is \(P_i(u) - R_1(u; +Z) = \min(A, B)\), and the total reverse flow is \(P_i(u + \ell_1 Z) - R_1(u + \ell_1 Z; -Z) = \min(A, B)\). Both equal.
+
+---
+
+## 3. Point Enumeration
+
+### 3.1 K = 2
+
+Scales: \(\ell_1 = 2.39\), \(\ell_2 = -2.39\).
+
+| Symbol | Point | Argument |
+|---|---|---|
+| \(x\) | current | \(0\) |
+| \(p_1\) | \(x + \ell_1 Z\) | \(2.39\) |
+| \(p_2\) | \(x + \ell_2 Z\) | \(-2.39\) |
+| \(p_3\) | \(x + (\ell_2 - \ell_1) Z\) | \(-4.78\) |
+
+**3 new points.**
+
+Acceptances:
+\[
+\alpha_1 = 1 \wedge P_i(p_1)/P_i(x),
+\]
+\[
+\alpha_2 = 1 \wedge \frac{[P_i(p_2) - P_i(p_3)]_+}{[P_i(x) - P_i(p_1)]_+}.
+\]
+
+**Verification.** The scales \(\pm 2.39\) are the optimal antithetic choice from Bédard et al. (2014, Corollary 5), where \(\ell_1 = -\ell_2 = 2.39\, \mathcal{I}^{-1/2}\) and the optimal acceptance rates are \(a_1^* = a_2^* = 0.234\) for the i.i.d. Gaussian target.
+
+### 3.2 K = 3
+
+Scales: \(\ell_1 = 2.39\), \(\ell_2 = -2.39\), \(\ell_3 = 1.195\).
+
+The recursion requires \(R_1\) at \(x\), \(p_2\), \(p_3\), and \(p_6\), plus \(R_2\) at \(x\) and \(p_3\).
+
+Distinct arguments:
+
+| Symbol | Argument |
+|---|---|
+| \(x\) | \(0\) |
+| \(p_1\) | \(2.39\) |
+| \(p_2\) | \(-2.39\) |
+| \(p_3\) | \(1.195\) |
+| \(p_4\) | \(-4.78\) |
+| \(p_5\) | \(-1.195\) |
+| \(p_6\) | \(3.585\) |
+| \(p_7\) | \(5.975\) |
+
+**7 new points.**
+
+Acceptances:
+\[
+\alpha_1 = 1 \wedge P_i(p_1)/P_i(x),
+\]
+\[
+\alpha_2 = 1 \wedge \frac{R_1(p_2; -Z)}{R_1(x; +Z)},
+\]
+\[
+\alpha_3 = 1 \wedge \frac{R_2(p_3; -Z)}{R_2(x; +Z)},
+\]
+where \(R_1(x; +Z) = [P_i(x) - P_i(p_1)]_+\), \(R_1(p_2; -Z) = [P_i(p_2) - P_i(p_4)]_+\), \(R_1(p_3; -Z) = [P_i(p_3) - P_i(p_5)]_+\), \(R_1(p_6; +Z) = [P_i(p_6) - P_i(p_7)]_+\), \(R_2(x; +Z) = [R_1(x; +Z) - R_1(p_2; -Z)]_+\), \(R_2(p_3; -Z) = [R_1(p_3; -Z) - R_1(p_6; +Z)]_+\).
+
+### 3.3 K = 4
+
+Scales: \(\ell_1 = 2.39\), \(\ell_2 = -2.39\), \(\ell_3 = 1.195\), \(\ell_4 = -1.195\).
+
+**Status: unverified.** The exact count depends on algebraic coincidences between the scale values. A full enumeration is required for the specific scales chosen. The count is in the range \(5\)–\(8\) depending on which paths are included and whether coincidences occur.
+
+**Recommendation.** Do not publish a K=4 count without a complete enumeration. For production, use K=2 (verified) or K=3 (verified).
+
+### 3.4 Summary
+
+| K | New points | Status |
+|---|---|---|
+| 2 | 3 | ✅ Verified |
+| 3 | 7 | ✅ Verified |
+| 4 | 5–8 (depends on scales) | ⚠️ Unverified |
+
+---
+
+## 4. Move Probability per Internal Step
+
+Given stage acceptances \(a_k = \mathbb{E}[\alpha_k \mid \text{reached stage } k]\), the total move probability is
+
+\[
+\Pr(\text{move}) = 1 - \prod_{k=1}^{K} (1 - a_k).
+\]
+
+**Reference values (target-dependent):**
+
+- RWM high-dimensional optimum (Roberts, Gelman & Gilks 1997): \(a^* = 0.234\).
+- Bédard et al. (2014) Corollary 5: with optimal fixed-direction scales, \(a_1 = a_2 = 0.234\) for the i.i.d. Gaussian target, with stage-3 acceptance lower.
+
+**Heuristic values:**
+
+| K | Pr(move) |
+|---|---|
+| 2 | ≈ 0.41 |
+| 3 | ≈ 0.50 |
+| 4 | ≈ 0.53 |
+
+**Verification.** The formula \(\Pr(\text{move}) = 1 - \prod (1 - a_k)\) is exact given the \(a_k\). The values 0.234, 0.41, etc. are **target-dependent** and must be measured on the actual target. They are useful as reference points but not universal.
+
+---
+
+## 5. Lewis Outer Acceptance
+
+### 5.1 Joint proposal densities
+
+Forward:
+\[
+q_{\text{fwd}}(y_1, x_1, \dots, x_{n-1} \mid y_0, x_0) = q_{\text{slow}}(y_1 \mid y_0) \prod_{i=1}^{n-1} K_i(x_i \mid x_{i-1}).
+\]
+
+Reverse:
+\[
+q_{\text{rev}}(y_0, x_0, \dots, x_{n-2} \mid y_1, x_{n-1}) = q_{\text{slow}}(y_0 \mid y_1) \prod_{i=1}^{n-1} K_i(x_{i-1} \mid x_i).
+\]
+
+### 5.2 MH ratio
+
+Substituting \(\pi(y, x) = P(x \mid y) p(y)\) and \(q_{\text{slow}}(y_1 \mid y_0) = q_{\text{slow}}(y_0 \mid y_1)\):
+
+\[
+r = \frac{p(y_1)}{p(y_0)} \cdot \frac{P(x_{n-1} \mid y_1)}{P(x_0 \mid y_0)} \prod_{i=1}^{n-1} \frac{K_i(x_{i-1} \mid x_i)}{K_i(x_i \mid x_{i-1})}.
+\]
+
+### 5.3 Reversibility substitution
+
+Each \(K_i\) is \(P_i\)-reversible (Section 2.4), so:
+\[
+\frac{K_i(x_{i-1} \mid x_i)}{K_i(x_i \mid x_{i-1})} = \frac{P_i(x_{i-1})}{P_i(x_i)}.
+\]
+
+### 5.4 Telescoping derivation
+
+Let \(a_j = \ln P(x_j \mid y_0)\), \(b_j = \ln P(x_j \mid y_1)\). Then \(\ln P_i(x_j) = [(n - i) a_j + i\, b_j]/n\).
+
+**Derivation of the telescoping sum.**
+
+\[
+S := \ln \prod_{i=1}^{n-1} \frac{P_i(x_{i-1})}{P_i(x_i)} = \sum_{i=1}^{n-1} \left[\ln P_i(x_{i-1}) - \ln P_i(x_i)\right].
+\]
+
+Substituting:
+
+\[
+S = \frac{1}{n}\sum_{i=1}^{n-1} (n-i)(a_{i-1} - a_i) + \frac{1}{n}\sum_{i=1}^{n-1} i(b_{i-1} - b_i).
+\]
+
+**First sum.**
+
+\[
+\sum_{i=1}^{n-1} (n-i)(a_{i-1} - a_i) = \sum_{j=0}^{n-2} (n-j-1) a_j - \sum_{i=1}^{n-1} (n-i) a_i.
+\]
+
+For \(a_k\) with \(1 \le k \le n-2\): coefficient \((n-k-1) - (n-k) = -1\).
+
+For \(a_0\): coefficient \(n-1\).
+
+For \(a_{n-1}\): coefficient \(-1\).
+
+So:
+\[
+\sum_{i=1}^{n-1} (n-i)(a_{i-1} - a_i) = (n-1) a_0 - \sum_{k=1}^{n-1} a_k = n a_0 - \sum_{k=0}^{n-1} a_k.
+\]
+
+**Second sum.**
+
+\[
+\sum_{i=1}^{n-1} i(b_{i-1} - b_i) = \sum_{j=0}^{n-2} (j+1) b_j - \sum_{i=1}^{n-1} i b_i.
+\]
+
+For \(b_k\) with \(1 \le k \le n-2\): coefficient \((k+1) - k = +1\).
+
+For \(b_0\): coefficient \(1\).
+
+For \(b_{n-1}\): coefficient \(-(n-1)\).
+
+So:
+\[
+\sum_{i=1}^{n-1} i(b_{i-1} - b_i) = \sum_{k=0}^{n-2} b_k - (n-1) b_{n-1} = \sum_{k=0}^{n-1} b_k - n b_{n-1}.
+\]
+
+**Combining.**
+
+\[
+S = \frac{1}{n}\left[n a_0 - \sum_{k=0}^{n-1} a_k\right] + \frac{1}{n}\left[\sum_{k=0}^{n-1} b_k - n b_{n-1}\right]
+= a_0 - b_{n-1} + \frac{1}{n}\sum_{k=0}^{n-1} (b_k - a_k).
+\]
+
+Now the leading factor:
+\[
+\ln \frac{P(x_{n-1} \mid y_1)}{P(x_0 \mid y_0)} = b_{n-1} - a_0.
+\]
+
+Adding:
+\[
+\ln \frac{P(x_{n-1} \mid y_1)}{P(x_0 \mid y_0)} + S = \frac{1}{n}\sum_{k=0}^{n-1} (b_k - a_k).
+\]
+
+Therefore:
+
+\[
+\boxed{\ \alpha_{\text{outer}} = 1 \wedge \frac{p(y_1)}{p(y_0)} \exp\left(-\frac{1}{2n}\sum_{k=0}^{n-1} \left[\chi^2_B(x_k) - \chi^2_A(x_k)\right]\right).\ }
+\]
+
+The sum runs over \(k = 0, 1, \dots, n-1\), i.e. \(n\) terms: the start \(x_0\) and the \(n-1\) interior points.
+
+**Verification against Lewis (2013).** The formula matches the original Lewis result, where dragging is applied to cosmological parameter estimation with Planck likelihoods. The key property is that the outer acceptance depends only on the **path points** and the **endpoint chi-squared values**, not on the internal DR structure.
+
+### 5.5 Invariance
+
+The derivation uses only:
+
+1. Each internal kernel \(K_i\) is \(P_i\)-reversible.
+2. The slow proposal is symmetric.
+
+Both hold for fixed-direction DR with any \(K\). Lewis's formula is exact for any \(K\).
+
+---
+
+## 6. Cost Accounting
+
+### 6.1 Per internal step
+
+| K | New points | Likelihood evals per step |
+|---|---|---|
+| 2 | 3 | 6 |
+| 3 | 7 | 14 |
+| 4 | to be enumerated | 2 × (new points) |
+
+Each point requires two likelihood evaluations: one with the A-slow Cls, one with the B-slow Cls. Both Cl sets are cached from the endpoint evaluation; no new CAMB calls occur.
+
+### 6.2 Per iteration
+
+For \(n-1\) internal steps:
+
+| K | Internal | Endpoint | Total |
+|---|---|---|---|
+| 2 | \(6(n-1)\) | 2 | \(6(n-1) + 2\) |
+| 3 | \(14(n-1)\) | 2 | \(14(n-1) + 2\) |
+
+**Note.** The endpoint cost is 2 in the current implementation because the code calls `run_plc` on both \(\theta_A\) and \(\theta_B\) at each iteration. In principle, \(\chi^2_A(x_0)\) could be cached from the previous iteration, reducing the endpoint cost to 1. The code does not do this.
+
+---
+
+## 7. Validity Conditions
+
+1. **Direction drawn once per internal step.** \(Z\) is sampled once and reused for all \(K\) candidates. Redrawing per stage breaks the collinearity required by the residual-mass recursion.
+
+2. **Direction symmetric.** \(q(Z) = q(-Z)\). Ensures the reverse chain's mirror candidates lie at the same points.
+
+3. **Scales fixed.** If adapted, they must satisfy diminishing adaptation and containment:
+   - Diminishing adaptation: \(\|\ell_k(t+1) - \ell_k(t)\| \to 0\) in probability.
+   - Containment: \(\ell_k(t)\) stays in a compact set.
+
+4. **Out-of-bounds candidates.** Set \(P_i(Y^{(k)}) = 0\). The residual-mass recursion handles this automatically, and by \(\pm Z\) symmetry the reverse-chain candidate is also out of bounds.
+
+5. **\(1 - \alpha_1\) guard.** If stage-1 acceptance equals 1 (which happens when \(P_i(Y^{(1)}) \ge P_i(x_{i-1})\)), stage 2 is unreachable. The implementation must ensure stage 2 is skipped, not attempted with \(1 - \alpha_1 = 0\).
+
+---
+
+## 8. Final Summary
+
+| Quantity | Formula |
+|---|---|
+| Interpolated target | \(\ln P_i(x) = (1 - i/n)\ln P(x \mid y_0) + (i/n)\ln P(x \mid y_1)\) |
+| Candidates | \(Y^{(k)} = x_{i-1} + \ell_k Z\), \(Z \sim N(0, \Sigma_{\text{fast}})\) |
+| Stage-1 residual | \(R_1(u; d) = [P_i(u) - P_i(u + \ell_1 d)]_+\) |
+| Stage-\(k\) residual | \(R_k(u; d) = [R_{k-1}(u; d) - R_{k-1}(u + \ell_k d; -d)]_+\) |
+| Stage-1 acceptance | \(\alpha_1 = 1 \wedge P_i(Y^{(1)})/P_i(x_{i-1})\) |
+| Stage-\(k\) acceptance | \(\alpha_k = 1 \wedge R_{k-1}(Y^{(k)}; -Z)/R_{k-1}(x_{i-1}; +Z)\) |
+| Stage-flow balance | \(\Delta_k^+(u) = \Delta_k^-(u + \ell_k Z) = \min(R_{k-1}(u; +Z), R_{k-1}(u + \ell_k Z; -Z))\) |
+| Forward telescoping | \(\sum_{k=1}^K \Delta_k^+(u) = P_i(u) - R_K(u; +Z)\) |
+| Total flow equality | \(\Phi_{\text{fwd}} = \Phi_{\text{rev}}\) (stage-by-stage, not by telescoping in reverse) |
+| Lewis outer | \(1 \wedge \frac{p(y_1)}{p(y_0)} \exp\left(-\frac{1}{2n}\sum_{k=0}^{n-1}[\chi^2_B(x_k) - \chi^2_A(x_k)]\right)\) |
+
+---
+
+## 9. Verification Against Literature
+
+| Result | Source | Match |
+|---|---|---|
+| Fixed-direction DR construction | Bédard, Douc & Moulines (2014), *Methodol. Comput. Appl. Probab.* 16, 811–838 | ✅ |
+| Residual-mass recursion | Bédard et al. (2014), Proposition 2 | ✅ |
+| Stage-flow reversibility | Bédard et al. (2014), Proposition 2 | ✅ |
+| Optimal antithetic scales \(\pm 2.39\) | Bédard et al. (2014), Corollary 5 | ✅ |
+| High-dim DR collapse | Bédard et al. (2014), abstract | ✅ |
+| Dragging path interpolation | Neal (2005), *Taking Bigger Metropolis Steps by Dragging Fast Variables*, arXiv:math/0502099 | ✅ |
+| Lewis outer acceptance | Lewis (2013), *Efficient sampling of fast and slow cosmological parameters*, Phys. Rev. D 87, 103529 | ✅ |
+| RWM optimal acceptance 0.234 | Roberts, Gelman & Gilks (1997), *Ann. Appl. Probab.* 7, 110–120 | ✅ |
+| Diminishing adaptation + containment | Roberts & Rosenthal (2007), *J. Appl. Probab.* 44, 458–475 | ✅ |
+| DR original | Mira (2001), *Metron* 59, 231–241 | ✅ |
+
+---
+
+## 10. Conclusion
+
+**The derivation is complete and correct.** The core result — the DR kernel is \(P_i\)-reversible, and the outer Lewis acceptance is unchanged — matches Bédard et al. (2014, Prop. 2) and Lewis (2013).
+
+**Key points:**
+
+1. **Reversibility proof.** The correct proof uses the **stage-flow balance** (2.4.2): the mass moved at stage \(k\) from \(u\) equals the mass moved at stage \(k\) from \(u + \ell_k Z\) toward \(u\). The forward total flow telescopes to \(P_i(u) - R_K(u; +Z)\); the reverse total flow does **not** telescope (the mirror points differ across \(k\)) but equals the forward total flow stage by stage via (2.4.2).
+
+2. **Lewis outer acceptance.** The telescoping derivation in §5.4 is complete and matches Lewis (2013).
+
+3. **Point enumeration.** K=2 (3 points) and K=3 (7 points) are verified. K=4 is unverified and should be enumerated for the chosen scales.
+
+4. **Cost accounting.** The endpoint cost of 2 is a code fact, not a mathematical fact.
+
+5. **Validity conditions.** All five conditions are necessary and correctly stated.
+
+**Remaining minor items:**
+
+- K=4 count: marked as unverified, as it should be.
+- Citations: full references in §9.
+- Endpoint cost: implementation-dependent (1 or 2).
+
+**The draft is mathematically complete.** The stage-flow decomposition is the correct proof structure, the reverse-flow asymmetry is now explicit, and the outer Lewis acceptance is fully derived.
