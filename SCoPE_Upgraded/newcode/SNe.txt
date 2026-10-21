@@ -1,0 +1,97 @@
+# Understanding the Pantheon+ Supernova Likelihood
+
+The Supernova (SNe) likelihood compares the **observed brightness** of Type Ia supernovae with the **theoretical distance** predicted by cosmological model. 
+
+Two files:
+1. `.dat` (The Data): What we observe.
+2. `.cov` (The Covariance): How confident we are in those observations, and how their errors are correlated.
+
+---
+
+### 1. The Physics
+Type Ia supernovae are "standardizable candles." Their intrinsic brightness is roughly the same everywhere. Therefore, their **apparent magnitude** (\(m\)) tells us their **distance**.
+*   **Comoving distance:** \(D_C(z)\) (Provided by CAMB's background solver).
+*   **Luminosity distance:** \(D_L(z) = (1+z) D_C(z)\).
+*   **Distance Modulus:** \(\mu_{\text{th}}(z) = 5 \log_{10}(D_L(z)) + 25\).
+*   **Apparent Magnitude:** \(m_{\text{th}} = \mu_{\text{th}}(z) + M_B\). (Where \(M_B\) is the absolute magnitude, a nuisance parameter we sample).
+
+The **residual** for a single supernova is:
+\[
+ r_i = m_{\text{obs}, i} - \left( 5 \log_{10}(D_L(z_i)) + 25 + M_B \right) 
+\]
+
+---
+
+### 2. The `.dat` File (The Observations)
+This file contains one row per supernova. We only care about 4 columns:
+*   `zHD`: The redshift of the supernova.
+*   `m_b_corr`: The observed apparent magnitude (already corrected for stretch and color).
+*   `CEPH_DIST`: The distance to the host galaxy measured via Cepheids (0 if not a calibrator).
+*   `IS_CALIBRATOR`: A flag (1 or 0).
+
+**The Calibrator Trick:**
+For most supernovae (`IS_CALIBRATOR = 0`), we calculate the theoretical distance from cosmological model (using CAMB's \(D_C(z)\)). 
+However, for ~40 supernovae, we *already know* the distance because they are in galaxies with measured Cepheid variables. For these (`IS_CALIBRATOR = 1`), we ignore the cosmology! We set \(\mu_{\text{th}} = \text{CEPH\_DIST}\). This anchors the absolute magnitude \(M_B\) and breaks the degeneracy between \(M_B\) and \(H_0\).
+
+---
+
+### 3. The `.cov` File (The Correlations)
+If all supernova measurements were independent, the \(\chi^2\) would just be:
+\[
+ \chi^2 = \sum_i \left( \frac{r_i}{\sigma_i} \right)^2 
+\]
+But supernovae are **not independent**. They share calibration uncertainties, dust maps, and peculiar velocity corrections. The `.cov` file is a massive \(1700 \times 1700\) matrix \(C\) that contains both the variance on the diagonal and the correlated systematics off-diagonal.
+
+The statistical definition of the likelihood is:
+\[
+ \chi^2_{\text{SN}} = \mathbf{r}^T \cdot C^{-1} \cdot \mathbf{r} 
+\]
+
+---
+
+### 4. The Cholesky Trick (How we do it in code)
+Inverting a \(1600 \times 1600\) matrix every MCMC step is incredibly slow and prone to numerical errors. Instead, at initialization, we decompose the covariance matrix into a lower-triangular matrix \(L\) such that:
+\[
+ C = L \cdot L^T 
+\]
+(We do this using `gsl_linalg_cholesky_decomp1`).
+
+Then, instead of calculating \(C^{-1}\), we solve the linear system \(L \mathbf{x} = \mathbf{r}\) for a new vector \(\mathbf{x}\). 
+The \(\chi^2\) becomes beautifully simple:
+\[
+ \chi^2_{\text{SN}} = \sum_i x_i^2 
+\]
+
+Because \(L\) is lower-triangular, solving \(L\mathbf{x} = \mathbf{r}\) is fast (it's just a forward substitution). In GSL, this is done by `gsl_blas_dtrsv`.
+
+---
+
+### 5. The Complete Code Flow
+
+#### Step A: Initialization (`sn_init`)
+Runs **once** per MCMC chain.
+1. Open `.dat`, read the 1700 rows, filter out bad data (keep \(z > 0.01\) or calibrators). Store in `g_sn_data`.
+2. Open `.cov`, read the \(1700 \times 1700\) matrix.
+3. Apply the exact same filter to the rows and columns of the matrix to get a \(1600 \times 1600\) matrix.
+4. Run Cholesky decomposition on the filtered matrix. Store the resulting \(L\) in `g_sn_chol`.
+5. Find `M_B` in `param_reader.ini` and save its index to `g_idx_M_B`.
+
+#### Step B: Evaluation (`sn_chi2`)
+Runs **thousands** of times.
+1. Read `M_B` from the proposed `task` array.
+2. For each supernova:
+   * If it's a calibrator, use `CEPH_DIST`.
+   * If not, calculate \(D_L = (1+z) \cdot D_C(z)\) using the \(D_C(z)\) array passed in from the fast CAMB background solver, and find \(\mu_{\text{th}}\).
+   * Compute the residual: `resid[i] = m_b_corr - (mu_th + M_B)`.
+3. Take the array of residuals `resid`.
+4. Solve \(L \mathbf{x} = \mathbf{r}\) in-place (overwrite `resid` with \(\mathbf{x}\)).
+5. Sum the squares: `chi2 = sum(resid[i]^2)`.
+
+---
+
+### Summary of why this architecture is so fast
+By putting the Supernova likelihood behind the `camb_background_` function, completely decouple it from the CMB. 
+
+*   **CMB path:** Requires the full Boltzmann code. Takes ~1 second.
+*   **SNe path:** Requires only the background expansion \(D_C(z)\). Takes ~1 millisecond.
+*   **The SNe code:** Is purely a matrix multiplication and a few `log10` calls. Takes ~1 millisecond.
