@@ -6,20 +6,29 @@
 #include <string.h>
 #include <gsl/gsl_eigen.h>
 #include <gsl/gsl_math.h>
+#include "compile_config.h"        /* MAX_* caps and DEF_* runtime defaults */
 #include "param_config_reader.h"
 #include "camb_interface.h"
 double get_time(void);
 #include "likelihood_interface.h"
 #include "emulator/include/emulator.h"
 
-#define EMULATOR_TYPE 1
-#define POLY_DEGREE 2
-#define FALLBACK_THRESHOLD 0.2
+// #define EMULATOR_TYPE 1
+// #define POLY_DEGREE 2
+// #define FALLBACK_THRESHOLD 0.2
+#define EMULATOR_TYPE          (global_config.emulator_type)
+#define POLY_DEGREE            (global_config.poly_degree)
+#define FALLBACK_THRESHOLD     (global_config.fallback_threshold)
 
-int USE_EMULATOR = 0;
-int USE_DRAGGING = 1;
-int VERBOSE      = 1;
-int TRAIN_ON_FALLBACK_ONLY = 0;
+// int USE_EMULATOR = 0;
+// int USE_DRAGGING = 1;
+// int VERBOSE      = 1;
+// int TRAIN_ON_FALLBACK_ONLY = 0;
+#define USE_EMULATOR           (global_config.use_emulator)
+#define USE_DRAGGING           (global_config.use_dragging)
+#define VERBOSE                (global_config.verbose)
+#define TRAIN_ON_FALLBACK_ONLY (global_config.train_on_fallback_only)
+
 
 #define DEBUG_PRINT(...) do { if (VERBOSE) { printf(__VA_ARGS__); fflush(stdout); } } while (0)
 
@@ -30,12 +39,10 @@ static int mapping_done = 0;
 static char outdir_buf[512];
 static const char *LOAD_COV_PATH = NULL;
 
-#define NOPARAM 26
-#define MAX_TASKARRAY_SIZE 150
+
 #define NR_END 1
 #define FREE_ARG char *
 
-#define CHAINS 2
 static short int Astier = 0;
 short int PARAMETERS = NOPARAM;
 
@@ -45,19 +52,24 @@ double get_time(void) {
     return ts.tv_sec + 1e-9 * ts.tv_nsec;
 }
 
-#define TAG_UPDATE_COV     400
-#define TAG_EMU_QUARANTINE 401
-#define N_DRAG 3
-#define MAX_FAST 60
-#define MAX_FAST_PACKED (1 + MAX_FAST + MAX_FAST*MAX_FAST)
+// #define TAG_UPDATE_COV     400
+// #define TAG_EMU_QUARANTINE 401
 
-#define EMU_BIAS_WINDOW    50
-#define EMU_BIAS_MIN_N     30
-#define N_RECOVERY         100
-#define MAX_EMU_RESCUES    20
-#define EMU_BIAS_MAX       5.0    
-#define FREE_REJECT_DCHI2_MAX  10.0   
-#define FREE_REJECT_RATIO      2      
+// #define N_DRAG 3
+#define N_DRAG                 (global_config.n_drag)
+
+// #define EMU_BIAS_MIN_N     30
+// #define N_RECOVERY         100
+// #define MAX_EMU_RESCUES    20
+// #define EMU_BIAS_MAX       5.0    
+// #define FREE_REJECT_DCHI2_MAX  10.0   
+// #define FREE_REJECT_RATIO      2      
+#define EMU_BIAS_MIN_N         (global_config.emu_bias_min_n)
+#define N_RECOVERY             (global_config.n_recovery)
+#define MAX_EMU_RESCUES        (global_config.max_emu_rescues)
+#define EMU_BIAS_MAX           (global_config.emu_bias_max)
+#define FREE_REJECT_DCHI2_MAX  (global_config.free_reject_dchi2_max)
+#define FREE_REJECT_RATIO      (global_config.free_reject_ratio)
 
 static int    emu_ring_head[CHAINS]        = {0};
 static int    emu_ring_n[CHAINS]           = {0};
@@ -98,27 +110,38 @@ unsigned short int EMU_LOGLIKE_POS;
 static unsigned int MULTIPURPOSE_REQUIRED = 1;
 static short int WMAP7 = 1;
 
-static unsigned int BEGINCOVUPDATE = 120;
-static unsigned int BEGINDRAGGING  = 150;
-static unsigned int MAXCHAINLENGTH = 50000;
+// static unsigned int BEGINCOVUPDATE = 120;
+// static unsigned int BEGINDRAGGING  = 150;
+// static unsigned int MAXCHAINLENGTH = 50000;
+#define BEGINCOVUPDATE         (global_config.begin_cov_update)
+#define BEGINDRAGGING          (global_config.begin_dragging)
+#define MAXCHAINLENGTH         (global_config.max_chain_length)
 
-static int GIVEMETASK = 1;
-static int TAKERESULT = 2;
-static int TAKETASK = 3;
-#define TAG_STOP 4
+// static int GIVEMETASK = 1;
+// static int TAKERESULT = 2;
+// static int TAKETASK = 3;
+// #define TAG_STOP 4
 
-#define SLAVEPARCHAIN 1
+// static double DECREASE_STEP = 0.9;
+// static double INCREASE_STEP = 1.0 / 0.9;
+#define DECREASE_STEP          (global_config.decrease_step)
+#define INCREASE_STEP          (global_config.increase_step)
 
-static double DECREASE_STEP = 0.9;
-static double INCREASE_STEP = 1.0 / 0.9;
+// static int HIGH_STEP_BOUND = 5;
+// static int LOW_STEP_BOUND = 3;
+#define HIGH_STEP_BOUND        (global_config.high_step_bound)
+#define LOW_STEP_BOUND         (global_config.low_step_bound)
 
-static int HIGH_STEP_BOUND = 5;
-static int LOW_STEP_BOUND = 3;
-const int UPDATE_TIME = 5;
-const unsigned int MAXPREVIOUSPOINTS = 5000;
-const unsigned int RMIN_POINTS = 120;
-const double RBREAK = 1.2;
-const unsigned int MIN_SIZE_FOR_FREEZE_IN = 500;
+// const int UPDATE_TIME = 5;
+// const unsigned int MAXPREVIOUSPOINTS = 5000;
+// const unsigned int RMIN_POINTS = 120;
+// const double RBREAK = 1.2;
+// const unsigned int MIN_SIZE_FOR_FREEZE_IN = 500;
+#define UPDATE_TIME            (global_config.update_time)
+#define MAXPREVIOUSPOINTS      (global_config.max_previous_points)
+#define RMIN_POINTS            (global_config.rmin_points)
+#define RBREAK                 (global_config.rbreak)
+#define MIN_SIZE_FOR_FREEZE_IN (global_config.min_size_for_freeze_in)
 
 extern void test_likelihood_(int *inputflag, double *cl_in_tt, double *cl_in_te, double *cl_in_ee, double *cl_in_bb);
 double drfactor;
@@ -373,8 +396,6 @@ void update_local_fast_covariance(double *buf) {
         for (int j = 0; j < N_FAST; j++) fast_evec[i][j] = buf[p++];
     fast_cov_ready = 1;
 }
-
-#define MAX_FILE_PARAMS 200
 
 static int current_param_index(const char *name) {
     int idx = 0;
@@ -1232,7 +1253,7 @@ int slave(int rank) {
     for (;;) {
         MPI_Status probe_status; int flag = 0;
         MPI_Iprobe(0, TAG_STOP, MPI_COMM_WORLD, &flag, &probe_status);
-        if (flag) { MPI_Recv(NULL, 0, MPI_INT, 0, TAG_STOP, MPI_COMM_WORLD, &probe_status); break; }
+        if (flag) { MPI_Recv(NULL, 0, MPI_INT, 0, TAG_STOP, MPI_COMM_WORLD, &probe_status); goto slave_cleanup; }
 
         int qflag = 0; MPI_Status qst;
         MPI_Iprobe(0, TAG_EMU_QUARANTINE, MPI_COMM_WORLD, &qflag, &qst);
@@ -1245,6 +1266,10 @@ int slave(int rank) {
 
         for (;;) {
             MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+            if (status.MPI_TAG == TAG_STOP) {
+                MPI_Recv(NULL, 0, MPI_INT, 0, TAG_STOP, MPI_COMM_WORLD, &status);
+                goto slave_cleanup;
+            }
             if (status.MPI_TAG == TAG_UPDATE_COV) {
                 MPI_Recv(fast_cov_buffer, MAX_FAST_PACKED, MPI_DOUBLE, 0, TAG_UPDATE_COV, MPI_COMM_WORLD, &status);
                 update_local_fast_covariance(fast_cov_buffer); continue;
@@ -1386,6 +1411,7 @@ int slave(int rank) {
         MPI_Send(task, TASKARRAY_SIZE, MPI_DOUBLE, 0, TAKERESULT, MPI_COMM_WORLD);
     }
 
+slave_cleanup: ;
     free(Cl_TT_A); free(Cl_TE_A); free(Cl_EE_A); free(Cl_BB_A);
     free(Cl_TT_B); free(Cl_TE_B); free(Cl_EE_B); free(Cl_BB_B);
     return 0;
@@ -1498,23 +1524,37 @@ void setVariables() {
 
 int main(int argc, char *argv[]) {
     MPI_Init(&argc, &argv);
-    int myrank, worldsize; MPI_Comm_rank(MPI_COMM_WORLD, &myrank); MPI_Comm_size(MPI_COMM_WORLD, &worldsize);
+    int myrank, worldsize; 
+    MPI_Comm_rank(MPI_COMM_WORLD, &myrank); 
+    MPI_Comm_size(MPI_COMM_WORLD, &worldsize);
     srand((unsigned)(time(NULL) ^ (myrank * 2654435761u)));
 
-    unsigned short int Restart = 0;
-    const char *outdir_default = "."; const char *outdir = outdir_default; const char *load_cov_path = NULL;
+    /* Step 1: load ini */
+    setVariables();
+    DEBUG_PRINT("Myrank : %d", myrank);
+
+    const char *outdir = global_config.outdir[0] ? global_config.outdir : ".";
+    const char *load_cov_path = global_config.load_cov_path[0] ? global_config.load_cov_path : NULL;
+    unsigned short int Restart = global_config.restart;
+
     for (int i = 1; i < argc; i++) {
-        if      (strcmp(argv[i], "-restart") == 0)                        Restart = 1;
-        else if (strcmp(argv[i], "-o") == 0 && i+1 < argc)                outdir = argv[++i];
-        else if (strcmp(argv[i], "-load-cov") == 0 && i+1 < argc)         load_cov_path = argv[++i];
-        else if (strcmp(argv[i], "-emu") == 0)                            USE_EMULATOR = 1;
-        else if (strcmp(argv[i], "-no-emu") == 0)                         USE_EMULATOR = 0;
-        else if (strcmp(argv[i], "-drag") == 0)                           USE_DRAGGING = 1;
-        else if (strcmp(argv[i], "-no-drag") == 0)                        USE_DRAGGING = 0;
-        else if (strcmp(argv[i], "-print") == 0)                          VERBOSE = 1;
-        else if (strcmp(argv[i], "-no-print") == 0)                       VERBOSE = 0;
-        else if (strcmp(argv[i], "-train-fallback-only") == 0)            TRAIN_ON_FALLBACK_ONLY = 1;   
-        else { if (myrank == 0) printf("Usage: %s [-restart] [-o outdir] [-load-cov file] [-emu|-no-emu] [-drag|-no-drag] [-print|-no-print] [-train-fallback-only]\n", argv[0]); MPI_Abort(MPI_COMM_WORLD, 1); }
+        if      (strcmp(argv[i], "-restart") == 0)                Restart = 1;
+        else if (strcmp(argv[i], "-o") == 0 && i+1 < argc)        outdir = argv[++i];
+        else if (strcmp(argv[i], "-load-cov") == 0 && i+1 < argc) load_cov_path = argv[++i];
+        else if (strcmp(argv[i], "-emu") == 0)                     global_config.use_emulator = 1;
+        else if (strcmp(argv[i], "-no-emu") == 0)                  global_config.use_emulator = 0;
+        else if (strcmp(argv[i], "-drag") == 0)                    global_config.use_dragging = 1;
+        else if (strcmp(argv[i], "-no-drag") == 0)                 global_config.use_dragging = 0;
+        else if (strcmp(argv[i], "-print") == 0)                   global_config.verbose = 1;
+        else if (strcmp(argv[i], "-no-print") == 0)                global_config.verbose = 0;
+        else if (strcmp(argv[i], "-train-fallback-only") == 0)     global_config.train_on_fallback_only = 1;
+        else {
+            if (myrank == 0)
+                printf("Usage: %s [-restart] [-o outdir] [-load-cov file] "
+                       "[-emu|-no-emu] [-drag|-no-drag] [-print|-no-print] "
+                       "[-train-fallback-only]\n", argv[0]);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
     LOAD_COV_PATH = load_cov_path;
 
@@ -1529,8 +1569,6 @@ int main(int argc, char *argv[]) {
     MPI_Barrier(MPI_COMM_WORLD);
     strncpy(outdir_buf, outdir, sizeof(outdir_buf)-1); outdir_buf[sizeof(outdir_buf)-1] = '\0';
     MPI_Bcast(outdir_buf, sizeof(outdir_buf), MPI_CHAR, 0, MPI_COMM_WORLD);
-
-    setVariables(); DEBUG_PRINT("Myrank : %d", myrank);
 
     /* Automatically disable dragging if there are no fast parameters */
     if (N_FAST == 0 && USE_DRAGGING) {
@@ -1568,7 +1606,8 @@ int main(int argc, char *argv[]) {
         if (myrank == 0) printf("[INFO] SNe likelihood disabled via param_reader.ini (USE_SN=0).\n");
     }
 
-    int totalrun, runperchain; drfactor = 0.7;
+    int totalrun, runperchain;
+    drfactor = global_config.initial_drfactor;
     if (worldsize > 101) { totalrun = 100; runperchain = 1; }
     else                 { runperchain = 100 / (worldsize - 1); totalrun = runperchain * (worldsize - 1); }
 
