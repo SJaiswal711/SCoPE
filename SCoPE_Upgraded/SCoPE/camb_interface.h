@@ -152,7 +152,7 @@ int param_iface_bg(double task[], int num_z, double *z_in,
     double Om_k  = omk;
     double Om_DE = 1.0 - Om_m - Om_r - Om_k;
     if (Om_DE < 0.0) return 0;
-
+  
     /* rdrag / zdrag via Eisenstein & Hu (1998) */
     double Ob_h2 = ombh2;
     double Om_h2 = ombh2 + omch2;
