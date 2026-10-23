@@ -15,8 +15,9 @@ CLIK=$SCOPE/data/clik
 
 export PATH="$GCC/bin:$PATH"
 
-CFITSIO_LIB=$CFITSIO/.libs
-RPATH="$GCC/lib64:$CFITSIO_LIB:$LAPACK/lib64:$GSL/lib:$CLIK/lib:$CAMB/fortran/Releaselib"
+# Library paths
+CFITSIO_LIB="$CFITSIO/lib:$CFITSIO/.libs"
+RPATH="$GCC/lib64:$CFITSIO/lib:$CFITSIO/.libs:$LAPACK/lib64:$GSL/lib:$CLIK/lib:$CAMB/fortran/Releaselib"
 
 export LD_LIBRARY_PATH="$RPATH:${LD_LIBRARY_PATH:-}"
 
@@ -26,9 +27,11 @@ mkdir -p build
 "$GCC/bin/gfortran" -O3 -fopenmp \
     -I"$CAMB/fortran/Releaselib" \
     -I"$CAMB/forutils/Releaselib" \
-    -Jbuild -c camb_iface.f90 -o build/camb_iface.o
+    -Jbuild \
+    -c camb_iface.f90 \
+    -o build/camb_iface.o
 
-# Compile and link
+# Compile C/MPI and link
 mpicc -O3 -fopenmp -o nmcmc \
     mcmc_scope.c \
     emulator/src/emulator.c \
@@ -46,12 +49,20 @@ mpicc -O3 -fopenmp -o nmcmc \
     -Iemulator/include \
     -I"$LAPACK/include" \
     -I"$CFITSIO" \
-    -L"$GSL/lib" -L"$CLIK/lib" \
-    -L"$LAPACK/lib64" -L"$CFITSIO_LIB" \
+    -L"$GSL/lib" \
+    -L"$CLIK/lib" \
+    -L"$LAPACK/lib64" \
+    -L"$CFITSIO/lib" \
+    -L"$CFITSIO/.libs" \
     -Wl,--disable-new-dtags \
     -Wl,-rpath,"$RPATH" \
     "$CAMB/fortran/Releaselib/camblib.so" \
-    -lclik -lgsl -lgslcblas -llapacke -llapack -lblas \
+    -lclik -lcfitsio \
+    -lgsl -lgslcblas \
+    -llapacke -llapack -lblas \
     -lgfortran -lm
 
 echo "Build completed: nmcmc"
+
+# Verify runtime dependencies
+ldd ./nmcmc | grep "not found" || true
